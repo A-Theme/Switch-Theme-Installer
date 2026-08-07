@@ -35,15 +35,14 @@ ROMFS       := romfs
 
 ARCH    := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 
-# SDL2 + SDL2_image are used only for the preview screen. Following
-# devkitPro's own official example pattern here (switch-examples'
-# graphics/sdl2/sdl2-simple/Makefile) rather than hand-listing the full
-# transitive link chain (EGL, drm_nouveau, libpng, libjpeg-turbo, etc.) —
-# pkg-config resolves whatever your installed portlib versions actually
-# need, which is far less likely to go stale or be wrong than a hardcoded
-# list would be.
+# SDL2 + SDL2_image + SDL2_ttf render the whole app now (menu and preview
+# both) — following devkitPro's own official example pattern here
+# (switch-examples' graphics/sdl2/sdl2-simple/Makefile) rather than
+# hand-listing the full transitive link chain (EGL, drm_nouveau, libpng,
+# libjpeg-turbo, freetype, etc.) — pkg-config resolves whatever your
+# installed portlib versions actually need.
 PKGCONF := aarch64-none-elf-pkg-config
-PC_LIBS := sdl2 SDL2_image
+PC_LIBS := sdl2 SDL2_image SDL2_ttf
 
 CFLAGS  := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES)
 CFLAGS  += $(INCLUDE) -D__SWITCH__

@@ -1,7 +1,8 @@
 // A-Theme Installer — a Switch homebrew (.nro) app that reads A-Theme's own
 // themes.json manifest and installs the selected theme's zip archive
-// directly onto the SD card, ready for Tinfoil to pick up. Also supports
-// previewing a theme's background image/logo before committing to it.
+// directly onto the SD card, ready for Tinfoil to pick up. Also previews a
+// theme's actual look (background, logo, selection colors, border,
+// progress bar) before you commit to keeping it.
 //
 // This does NOT reproduce the visual theme *editor* — that's a browser/
 // desktop tool by design (mouse, keyboard, color pickers). This app's job
@@ -13,46 +14,42 @@
 //           + = exit
 //
 // Build requirements: devkitA64, libnx, and switch-curl / switch-mbedtls /
-// switch-zlib / switch-zziplib / switch-sdl2 / switch-sdl2_image.
-// See BUILD.md in this folder.
+// switch-zlib / switch-zziplib / switch-sdl2 / switch-sdl2_image /
+// switch-sdl2_ttf. See BUILD.md.
 //
-// --- On the bundled/pulled-in dependencies, and what's actually verified ---
-// include/jsmn.h   — real, unmodified JSON tokenizer (MIT, zserge/jsmn).
-//                     ALL of this file's JSON-parsing logic (manifest
-//                     parsing, and the nested background.image/logo field
-//                     lookup used for previews) was compiled and run for
-//                     real on a regular PC against actual sample content
-//                     from the A-Theme project before being written here.
-//                     See json_object_get_string() / parse_manifest().
-// switch-zziplib   — existing devkitPro package, reads the downloaded
-//                     .zip theme archives. Switch-specific; could not be
-//                     compile-tested in the environment this was written
-//                     in.
-// switch-sdl2,
-// switch-sdl2_image — existing devkitPro packages, used ONLY for the
-//                     preview screen (decoding + displaying the theme's
-//                     background image/logo). This is the single riskiest
-//                     part of this whole app: it means briefly tearing
-//                     down libnx's text console and standing up SDL2's
-//                     video system in its place, then tearing THAT down
-//                     and reinitializing the console again afterward.
-//                     That specific console<->SDL2 handoff is genuinely
-//                     unverified — see BUILD.md's troubleshooting section,
-//                     which flags this as the most likely spot to need
-//                     real debugging on real hardware.
+// --- Architecture note (read this if debugging a crash) ---
+// An earlier version of this app used libnx's text console for the menu
+// and only switched to SDL2 for the preview screen, toggling between them
+// with consoleExit()/consoleInit(). That caused a real crash on real
+// hardware after leaving the preview. This version removes that risk
+// entirely by never using the console at all — SDL2 owns the display for
+// the app's whole lifetime, menu included. If you still hit a crash, it's
+// something new, not that same handoff.
+//
+// --- On what's verified vs. not ---
+// ALL of the JSON-parsing and color-parsing logic in this file (manifest
+// parsing, nested theme.json field lookups for background/selection/
+// border/progressBar/logo, and hex color decoding) was compiled and run
+// for real on a PC against actual A-Theme content before being written
+// here — see parse_manifest(), parse_theme_visuals(), parse_hex_color().
+// The Switch-specific graphics/font/zip pieces (SDL2, SDL2_image,
+// SDL2_ttf, the Pl shared-font service, zziplib) could not be tested
+// outside real hardware — see BUILD.md's troubleshooting section.
 
 #include <switch.h>
 #include <curl/curl.h>
 #include <zzip/zzip.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
+#include <SDL2/SDL_ttf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> // strcasecmp
+#include <ctype.h>   // isxdigit
 #include <sys/stat.h>
 #include <dirent.h>
-#include <unistd.h> // rmdir()
+#include <unistd.h>  // rmdir()
 #include <stdbool.h>
 
 #define JSMN_STATIC
@@ -60,37 +57,40 @@
 
 // ---- Configuration -------------------------------------------------------
 
-// The A-Theme project's own existing manifest — same file already used
-// elsewhere in the project. Nothing new needs to be created or maintained
-// for this app to work; it reads what's already there.
 #define MANIFEST_URL "https://raw.githubusercontent.com/A-Theme/Tinfoil-Themes/main/themes.json"
-
-// Where installed themes get written on the SD card (Tinfoil's own layout).
 #define THEMES_ROOT "sdmc:/switch/tinfoil/themes/"
-
-// Scratch space for this app's own temp files (the downloaded zip, briefly,
-// before it's extracted and deleted).
 #define APP_DATA_DIR "sdmc:/switch/a-theme-installer/"
 #define TEMP_ZIP_PATH APP_DATA_DIR "_download.zip"
+
+#define SCREEN_W 1280
+#define SCREEN_H 720
 
 #define MAX_THEMES   400
 #define PAGE_SIZE    14
 #define NAME_LEN     110
 #define URL_LEN      220
 #define FOLDER_LEN   96
-#define MAX_TOKENS   (MAX_THEMES * 2 + 16) // themes array entries + a little headroom
+#define MAX_TOKENS   (MAX_THEMES * 2 + 16)
 
 typedef struct {
-    char name[NAME_LEN];      // display name shown in the menu
-    char folder[FOLDER_LEN];  // destination folder name on the SD card
-    char url[URL_LEN];        // full https URL to the theme's .zip
+    char name[NAME_LEN];
+    char folder[FOLDER_LEN];
+    char url[URL_LEN];
 } Theme;
 
-// Growable buffer used for all curl downloads.
 typedef struct {
     char *data;
     size_t size;
 } MemBuf;
+
+typedef struct { Uint8 r, g, b, a; } RGBA;
+
+// ---- Graphics globals (SDL2 owns the display for the app's whole life) -----
+
+static SDL_Window *g_window = NULL;
+static SDL_Renderer *g_renderer = NULL;
+static TTF_Font *g_font = NULL;
+static TTF_Font *g_font_small = NULL;
 
 // ---- Networking helpers ---------------------------------------------------
 
@@ -98,7 +98,7 @@ static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     MemBuf *mem = (MemBuf *)userp;
     char *ptr = realloc(mem->data, mem->size + realsize + 1);
-    if (!ptr) return 0; // out of memory — abort this transfer
+    if (!ptr) return 0;
     mem->data = ptr;
     memcpy(&(mem->data[mem->size]), contents, realsize);
     mem->size += realsize;
@@ -120,7 +120,7 @@ static bool http_get(const char *url, MemBuf *out) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)out);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "A-Theme-Installer/1.0 (Switch)");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L); // theme zips can be a few MB
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -203,8 +203,6 @@ static bool write_file(const char *path, const char *data, size_t size) {
     return written == size;
 }
 
-// Reads an entire file into a malloc'd buffer. Caller frees. Returns false
-// (and doesn't touch *out_data) if the file can't be opened.
 static bool read_file(const char *path, char **out_data, size_t *out_size) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -222,10 +220,6 @@ static bool read_file(const char *path, char **out_data, size_t *out_size) {
     return true;
 }
 
-// Recursively deletes a folder and everything in it. Used to undo an
-// install if the user rejects a theme after previewing it. Our own
-// extracted theme folders are always flat (no subfolders), but this
-// handles nested content gracefully too, just in case.
 static void remove_dir_recursive(const char *path) {
     DIR *d = opendir(path);
     if (!d) { remove(path); return; }
@@ -242,9 +236,9 @@ static void remove_dir_recursive(const char *path) {
     rmdir(path);
 }
 
-// ---- JSON helpers (shared by manifest parsing and theme.json field lookup) --
-// This logic was compiled standalone and run against real manifest AND real
-// theme.json content before being written here — see the file header.
+// ---- JSON helpers ----------------------------------------------------------
+// Verified for real (compiled + run on a PC against actual A-Theme content)
+// before being written here — see the file header.
 
 static int json_streq(const char *json, jsmntok_t *tok, const char *s) {
     if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
@@ -254,16 +248,13 @@ static int json_streq(const char *json, jsmntok_t *tok, const char *s) {
     return 0;
 }
 
-// Returns the token index immediately after the full subtree rooted at
-// tokens[idx] — needed to correctly skip over nested objects/arrays while
-// walking a flat jsmn token stream.
 static int skip_token_subtree(jsmntok_t *tokens, int idx) {
     jsmntok_t *t = &tokens[idx];
     int end = idx + 1;
     if (t->type == JSMN_OBJECT) {
         for (int n = 0; n < t->size; n++) {
-            end = skip_token_subtree(tokens, end); // key
-            end = skip_token_subtree(tokens, end); // value
+            end = skip_token_subtree(tokens, end);
+            end = skip_token_subtree(tokens, end);
         }
     } else if (t->type == JSMN_ARRAY) {
         for (int n = 0; n < t->size; n++) {
@@ -273,15 +264,13 @@ static int skip_token_subtree(jsmntok_t *tokens, int idx) {
     return end;
 }
 
-// Finds the token index of the value for `key` within the object at
-// tokens[obj_idx] (immediate children only, not nested deeper).
 static int json_object_find_child_index(const char *json, jsmntok_t *tokens, int obj_idx, const char *key) {
     jsmntok_t *obj = &tokens[obj_idx];
     if (obj->type != JSMN_OBJECT) return -1;
     int i = obj_idx + 1;
     for (int n = 0; n < obj->size; n++) {
         int key_idx = i;
-        int val_idx = key_idx + 1; // JSON object keys are always plain strings
+        int val_idx = key_idx + 1;
         if (json_streq(json, &tokens[key_idx], key)) {
             return val_idx;
         }
@@ -303,9 +292,40 @@ static bool json_object_get_string(const char *json, jsmntok_t *tokens, int obj_
     return true;
 }
 
-// Turns a theme's zip URL into a readable display name and a filesystem-safe
-// folder name. E.g. ".../Non_Aramaki_Themes/hbg_crysis.zip?" becomes display
-// name "[Community] hbg crysis" and folder "hbg_crysis".
+// Parses a Tinfoil-style hex color (bare or #-prefixed, 3/4/6/8 hex
+// digits, RRGGBB or RRGGBBAA) into RGBA components. Verified against every
+// real color value seen across this project's sample themes.
+static bool parse_hex_color(const char *hex, Uint8 *r, Uint8 *g, Uint8 *b, Uint8 *a) {
+    if (!hex || !hex[0]) return false;
+    if (hex[0] == '#') hex++;
+    size_t len = strlen(hex);
+    char buf[9];
+    if (len == 3 || len == 4) {
+        for (size_t i = 0; i < len; i++) { buf[i * 2] = hex[i]; buf[i * 2 + 1] = hex[i]; }
+        buf[len * 2] = '\0';
+        len = len * 2;
+    } else if (len == 6 || len == 8) {
+        strncpy(buf, hex, 8);
+        buf[len] = '\0';
+    } else {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!isxdigit((unsigned char)buf[i])) return false;
+    }
+    char rs[3] = { buf[0], buf[1], 0 }, gs[3] = { buf[2], buf[3], 0 }, bs[3] = { buf[4], buf[5], 0 };
+    unsigned int rr = (unsigned int)strtoul(rs, NULL, 16);
+    unsigned int gg = (unsigned int)strtoul(gs, NULL, 16);
+    unsigned int bb = (unsigned int)strtoul(bs, NULL, 16);
+    unsigned int aa = 255;
+    if (len == 8) {
+        char as[3] = { buf[6], buf[7], 0 };
+        aa = (unsigned int)strtoul(as, NULL, 16);
+    }
+    *r = (Uint8)rr; *g = (Uint8)gg; *b = (Uint8)bb; *a = (Uint8)aa;
+    return true;
+}
+
 static void derive_names(const char *url, char *display_out, size_t display_cap,
                           char *folder_out, size_t folder_cap) {
     const char *slash = strrchr(url, '/');
@@ -396,7 +416,7 @@ static bool extract_zip(const char *zip_path, const char *dest_dir, bool *found_
     while (zzip_dir_read(dir, &dirent)) {
         const char *entry_name = dirent.d_name;
         size_t nlen = strlen(entry_name);
-        if (nlen == 0 || entry_name[nlen - 1] == '/') continue; // directory entry
+        if (nlen == 0 || entry_name[nlen - 1] == '/') continue;
 
         const char *base = strrchr(entry_name, '/');
         base = base ? base + 1 : entry_name;
@@ -428,11 +448,10 @@ static bool extract_zip(const char *zip_path, const char *dest_dir, bool *found_
         zzip_file_close(zf);
 
         if (read_ok) {
-            // A-Theme's zips package the config file as "settings.json" (real
-            // theme files from this project have always used that name), but
-            // Tinfoil itself reads "theme.json" from the SD card. Normalize
-            // whichever one we find to the name Tinfoil actually expects —
-            // everything else keeps its original filename.
+            // A-Theme's zips package the config file as "settings.json"
+            // (confirmed against real theme files), but Tinfoil reads
+            // "theme.json" from the SD card. Normalize whichever name we
+            // find to what Tinfoil actually expects.
             bool is_config = (strcasecmp(base, "theme.json") == 0 ||
                                strcasecmp(base, "settings.json") == 0);
             const char *dest_name = is_config ? "theme.json" : base;
@@ -490,184 +509,381 @@ static bool install_theme(const Theme *t, char *status_detail, size_t status_cap
     return true;
 }
 
-// ---- Preview image lookup ----------------------------------------------------
+// ---- Theme visuals (for the preview mockup) ---------------------------------
+// Verified for real (compiled + run against a complete, actual A-Theme
+// settings.json) before being written here — every field below, including
+// the nested ones, came back correct in that test.
 
-// After a theme is installed, figures out what image to preview: prefers
-// background.image, falls back to logo. If that reference is a local
-// filename (already sitting in the theme's folder from extraction), reads
-// it straight off the SD card. If it's a remote http(s) URL, downloads it.
-// Returns the raw, still-encoded (PNG/JPG) image bytes on success.
-static bool find_preview_image_bytes(const char *dest_dir, char **out_data, size_t *out_size) {
+typedef struct {
+    bool has_bg_color;       RGBA bg_color;
+    bool has_text_color;     RGBA text_color;
+    bool has_sel_color;      RGBA sel_color;
+    bool has_sel_bg;         RGBA sel_bg;
+    bool has_sel_border;     RGBA sel_border;
+    bool has_border;         RGBA border_color;
+    bool has_progress_color; RGBA progress_color;
+    bool has_progress_bg;    RGBA progress_bg;
+    char logo_ref[URL_LEN];
+    bool has_logo;
+} ThemeVisuals;
+
+static bool get_color_field(const char *json, jsmntok_t *tokens, int obj_idx, const char *key, RGBA *out) {
+    char hexbuf[16];
+    if (!json_object_get_string(json, tokens, obj_idx, key, hexbuf, sizeof(hexbuf))) return false;
+    return parse_hex_color(hexbuf, &out->r, &out->g, &out->b, &out->a);
+}
+
+static void parse_theme_visuals(const char *json, jsmntok_t *tokens, ThemeVisuals *v) {
+    memset(v, 0, sizeof(*v));
+    v->has_text_color = get_color_field(json, tokens, 0, "color", &v->text_color);
+    v->has_logo = json_object_get_string(json, tokens, 0, "logo", v->logo_ref, sizeof(v->logo_ref));
+
+    int bg_idx = json_object_find_child_index(json, tokens, 0, "background");
+    if (bg_idx >= 0 && tokens[bg_idx].type == JSMN_OBJECT) {
+        v->has_bg_color = get_color_field(json, tokens, bg_idx, "color", &v->bg_color);
+    }
+
+    int sel_idx = json_object_find_child_index(json, tokens, 0, "selection");
+    if (sel_idx >= 0 && tokens[sel_idx].type == JSMN_OBJECT) {
+        v->has_sel_color = get_color_field(json, tokens, sel_idx, "color", &v->sel_color);
+        int sel_bg_idx = json_object_find_child_index(json, tokens, sel_idx, "background");
+        if (sel_bg_idx >= 0 && tokens[sel_bg_idx].type == JSMN_OBJECT) {
+            v->has_sel_bg = get_color_field(json, tokens, sel_bg_idx, "color", &v->sel_bg);
+        }
+        int sel_border_idx = json_object_find_child_index(json, tokens, sel_idx, "border");
+        if (sel_border_idx >= 0 && tokens[sel_border_idx].type == JSMN_OBJECT) {
+            v->has_sel_border = get_color_field(json, tokens, sel_border_idx, "color", &v->sel_border);
+        }
+    }
+
+    int border_idx = json_object_find_child_index(json, tokens, 0, "border");
+    if (border_idx >= 0 && tokens[border_idx].type == JSMN_OBJECT) {
+        v->has_border = get_color_field(json, tokens, border_idx, "color", &v->border_color);
+    }
+
+    int pb_idx = json_object_find_child_index(json, tokens, 0, "progressBar");
+    if (pb_idx >= 0 && tokens[pb_idx].type == JSMN_OBJECT) {
+        v->has_progress_color = get_color_field(json, tokens, pb_idx, "color", &v->progress_color);
+        int pb_bg_idx = json_object_find_child_index(json, tokens, pb_idx, "background");
+        if (pb_bg_idx >= 0 && tokens[pb_bg_idx].type == JSMN_OBJECT) {
+            v->has_progress_bg = get_color_field(json, tokens, pb_bg_idx, "color", &v->progress_bg);
+        }
+    }
+}
+
+// ---- Low-level drawing helpers ----------------------------------------------
+
+static void fill_rect(int x, int y, int w, int h, RGBA c) {
+    SDL_SetRenderDrawColor(g_renderer, c.r, c.g, c.b, c.a);
+    SDL_Rect r = { x, y, w, h };
+    SDL_RenderFillRect(g_renderer, &r);
+}
+
+static void draw_rect_outline(int x, int y, int w, int h, RGBA c, int thickness) {
+    SDL_SetRenderDrawColor(g_renderer, c.r, c.g, c.b, c.a);
+    for (int i = 0; i < thickness; i++) {
+        SDL_Rect r = { x + i, y + i, w - 2 * i, h - 2 * i };
+        if (r.w <= 0 || r.h <= 0) break;
+        SDL_RenderDrawRect(g_renderer, &r);
+    }
+}
+
+static void draw_text_ex(TTF_Font *font, int x, int y, const char *text, SDL_Color color) {
+    if (!font || !text || !text[0]) return;
+    SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, color);
+    if (!surf) return;
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(g_renderer, surf);
+    if (tex) {
+        SDL_Rect dst = { x, y, surf->w, surf->h };
+        SDL_RenderCopy(g_renderer, tex, NULL, &dst);
+        SDL_DestroyTexture(tex);
+    }
+    SDL_FreeSurface(surf);
+}
+
+static void draw_text(int x, int y, const char *text, SDL_Color color) {
+    draw_text_ex(g_font, x, y, text, color);
+}
+static void draw_text_small(int x, int y, const char *text, SDL_Color color) {
+    draw_text_ex(g_font_small, x, y, text, color);
+}
+
+// Loads an image from a local extracted file (bare filename or a full
+// sdmc: path — only the basename is used, matching how extract_zip()
+// flattened everything) or a remote http(s) URL. Returns a texture, or
+// NULL if unavailable/undecodable — callers treat that as "just skip it",
+// never as a hard failure.
+static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
+    if (!ref || !ref[0]) return NULL;
+
+    char *data = NULL;
+    size_t size = 0;
+    bool have_data = false;
+
+    if (strncmp(ref, "http://", 7) == 0 || strncmp(ref, "https://", 8) == 0) {
+        MemBuf buf;
+        if (http_get(ref, &buf)) { data = buf.data; size = buf.size; have_data = true; }
+    } else {
+        const char *slash = strrchr(ref, '/');
+        const char *basename = slash ? slash + 1 : ref;
+        char local_path[500];
+        snprintf(local_path, sizeof(local_path), "%s/%s", dest_dir, basename);
+        have_data = read_file(local_path, &data, &size);
+    }
+    if (!have_data) return NULL;
+
+    SDL_RWops *rw = SDL_RWFromConstMem(data, (int)size);
+    SDL_Surface *surf = rw ? IMG_Load_RW(rw, 1) : NULL;
+    SDL_Texture *tex = surf ? SDL_CreateTextureFromSurface(g_renderer, surf) : NULL;
+    if (surf) SDL_FreeSurface(surf);
+    free(data);
+    return tex;
+}
+
+// ---- Preview screen -----------------------------------------------------------
+// Builds a rough mockup of the real Tinfoil layout — icon grid, a
+// "selected" tile using the theme's actual selection colors, a border
+// frame, and a progress bar — using the theme's real colors, background,
+// and logo. Not pixel-identical to Tinfoil (this app doesn't have
+// Tinfoil's actual layout code to reference), but enough to see whether a
+// theme's palette and assets actually work together before installing it
+// for real.
+//
+// Returns true if the user pressed A (keep), false for B (undo).
+static bool show_theme_preview_and_confirm(const char *dest_dir, const char *theme_name) {
     char theme_json_path[350];
     snprintf(theme_json_path, sizeof(theme_json_path), "%s/theme.json", dest_dir);
 
     char *json = NULL;
     size_t json_len = 0;
-    if (!read_file(theme_json_path, &json, &json_len)) return false;
+    bool have_json = read_file(theme_json_path, &json, &json_len);
 
     jsmntok_t tokens[512];
-    jsmn_parser p;
-    jsmn_init(&p);
-    int r = jsmn_parse(&p, json, json_len, tokens, 512);
-    if (r < 1 || tokens[0].type != JSMN_OBJECT) { free(json); return false; }
-
-    char image_ref[URL_LEN] = "";
-    bool found = false;
-
-    int bg_idx = json_object_find_child_index(json, tokens, 0, "background");
-    if (bg_idx >= 0 && tokens[bg_idx].type == JSMN_OBJECT) {
-        found = json_object_get_string(json, tokens, bg_idx, "image", image_ref, sizeof(image_ref));
-    }
-    if (!found) {
-        found = json_object_get_string(json, tokens, 0, "logo", image_ref, sizeof(image_ref));
-    }
-    free(json);
-    if (!found || image_ref[0] == '\0') return false;
-
-    if (strncmp(image_ref, "http://", 7) == 0 || strncmp(image_ref, "https://", 8) == 0) {
-        MemBuf buf;
-        if (!http_get(image_ref, &buf)) return false;
-        *out_data = buf.data;
-        *out_size = buf.size;
-        return true;
+    int tokcount = 0;
+    if (have_json) {
+        jsmn_parser p;
+        jsmn_init(&p);
+        tokcount = jsmn_parse(&p, json, json_len, tokens, 512);
+        if (tokcount < 1 || tokens[0].type != JSMN_OBJECT) tokcount = 0;
     }
 
-    // Local reference — could be a bare filename or a full sdmc: path from
-    // the original theme.json; either way, what matters is the basename,
-    // since that's what extract_zip() flattened everything to.
-    const char *slash = strrchr(image_ref, '/');
-    const char *basename = slash ? slash + 1 : image_ref;
-    char local_path[500];
-    snprintf(local_path, sizeof(local_path), "%s/%s", dest_dir, basename);
+    ThemeVisuals visuals;
+    memset(&visuals, 0, sizeof(visuals));
+    char bg_ref[URL_LEN] = "";
+    bool has_bg_image = false;
 
-    char *data = NULL;
-    size_t size = 0;
-    if (!read_file(local_path, &data, &size)) return false;
-    *out_data = data;
-    *out_size = size;
-    return true;
-}
-
-// ---- Preview screen (SDL2 / SDL2_image) --------------------------------------
-// The riskiest part of this app — see the file header and BUILD.md.
-// Tears down the libnx text console, shows the decoded image fullscreen via
-// SDL2, waits for A (keep) or B (undo), then restores the console.
-//
-// Returns true if the user chose to KEEP the theme, false to undo it.
-static bool show_preview_and_confirm(const char *image_data, size_t image_size, const char *theme_name) {
-    consoleExit(NULL);
-
-    bool keep = true; // if SDL fails to even start, default to keeping the
-                       // install rather than punishing the user for a
-                       // preview-only failure — the theme itself is fine.
-
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        consoleInit(NULL);
-        printf("Preview unavailable (SDL init failed): %s\n", SDL_GetError());
-        printf("The theme is still installed. Press A to continue.\n");
-        consoleUpdate(NULL);
-        PadState pad;
-        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-        padInitializeDefault(&pad);
-        while (appletMainLoop()) {
-            padUpdate(&pad);
-            if (padGetButtonsDown(&pad) & HidNpadButton_A) break;
-            consoleUpdate(NULL);
-        }
-        return true;
-    }
-
-    IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
-
-    SDL_Window *window = NULL;
-    SDL_Renderer *renderer = NULL;
-    SDL_CreateWindowAndRenderer(1280, 720, 0, &window, &renderer);
-
-    SDL_RWops *rw = SDL_RWFromConstMem(image_data, (int)image_size);
-    SDL_Surface *surface = rw ? IMG_Load_RW(rw, 1) : NULL;
-    SDL_Texture *texture = surface ? SDL_CreateTextureFromSurface(renderer, surface) : NULL;
-
-    if (!texture) {
-        // Couldn't decode the image — don't punish the install for it,
-        // just skip straight to "keep" and let the user know via console
-        // afterward.
-        keep = true;
-    } else {
-        int iw = surface->w, ih = surface->h;
-        float scale = 1280.0f / iw;
-        if (ih * scale > 720.0f) scale = 720.0f / ih;
-        int dw = (int)(iw * scale), dh = (int)(ih * scale);
-        SDL_Rect dst = { (1280 - dw) / 2, (720 - dh) / 2, dw, dh };
-
-        PadState pad;
-        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-        padInitializeDefault(&pad);
-
-        bool waiting = true;
-        while (appletMainLoop() && waiting) {
-            padUpdate(&pad);
-            u64 kDown = padGetButtonsDown(&pad);
-            if (kDown & HidNpadButton_A) { keep = true; waiting = false; }
-            if (kDown & HidNpadButton_B) { keep = false; waiting = false; }
-
-            SDL_SetRenderDrawColor(renderer, 11, 20, 32, 255); // matches the web editor's dark bg
-            SDL_RenderClear(renderer);
-            SDL_RenderCopy(renderer, texture, NULL, &dst);
-            SDL_RenderPresent(renderer);
+    if (tokcount > 0) {
+        parse_theme_visuals(json, tokens, &visuals);
+        int bg_idx = json_object_find_child_index(json, tokens, 0, "background");
+        if (bg_idx >= 0 && tokens[bg_idx].type == JSMN_OBJECT) {
+            has_bg_image = json_object_get_string(json, tokens, bg_idx, "image", bg_ref, sizeof(bg_ref));
         }
     }
 
-    if (texture) SDL_DestroyTexture(texture);
-    if (surface) SDL_FreeSurface(surface);
-    if (renderer) SDL_DestroyRenderer(renderer);
-    if (window) SDL_DestroyWindow(window);
-    IMG_Quit();
-    SDL_Quit();
+    SDL_Texture *bg_tex = has_bg_image ? load_theme_image(dest_dir, bg_ref) : NULL;
+    SDL_Texture *logo_tex = visuals.has_logo ? load_theme_image(dest_dir, visuals.logo_ref) : NULL;
 
-    consoleInit(NULL);
-    return keep;
-}
+    if (json) free(json);
 
-// ---- UI -----------------------------------------------------------------------
+    RGBA bg_fallback     = visuals.has_bg_color ? visuals.bg_color : (RGBA){ 15, 28, 43, 255 };
+    RGBA text_color      = visuals.has_text_color ? visuals.text_color : (RGBA){ 234, 241, 250, 255 };
+    RGBA sel_color       = visuals.has_sel_color ? visuals.sel_color : (RGBA){ 255, 255, 255, 255 };
+    RGBA sel_bg          = visuals.has_sel_bg ? visuals.sel_bg : (RGBA){ 255, 255, 255, 40 };
+    RGBA sel_border      = visuals.has_sel_border ? visuals.sel_border : sel_color;
+    RGBA border_color    = visuals.has_border ? visuals.border_color : (RGBA){ 255, 255, 255, 30 };
+    RGBA progress_color  = visuals.has_progress_color ? visuals.progress_color : (RGBA){ 80, 200, 120, 255 };
+    RGBA progress_bg     = visuals.has_progress_bg ? visuals.progress_bg : (RGBA){ 255, 255, 255, 25 };
 
-static void render_menu(Theme *themes, int count, int cursor, int scroll, const char *status) {
-    printf("\x1b[1;1H\x1b[2J"); // clear screen
-    printf("\x1b[36;1mA-Theme Installer\x1b[0m - Tinfoil theme downloader\n");
-    printf("--------------------------------------------------------\n");
-
-    if (count == 0) {
-        printf("\nNo themes found in the manifest.\n");
-    } else {
-        int end = scroll + PAGE_SIZE;
-        if (end > count) end = count;
-        for (int i = scroll; i < end; i++) {
-            printf("%s %s\n", (i == cursor) ? "\x1b[33;1m>" : " ", themes[i].name);
-        }
-        if (count > PAGE_SIZE) {
-            printf("\x1b[0m\n(%d/%d)\n", cursor + 1, count);
-        }
-    }
-
-    printf("\x1b[0m\n--------------------------------------------------------\n");
-    if (status[0]) printf("%s\n", status);
-    printf("A = Install    Y = Preview then install    + = Exit\n");
-}
-
-// ---- Entry point ------------------------------------------------------------
-
-int main(int argc, char **argv) {
-    consoleInit(NULL);
-    romfsInit(); // mounts the bundled cacert.pem for TLS verification
+    SDL_Color text_sdl = { text_color.r, text_color.g, text_color.b, 255 };
+    SDL_Color hint_sdl = { 200, 210, 225, 255 };
 
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
 
+    bool keep = true;
+    bool waiting = true;
+    while (appletMainLoop() && waiting) {
+        padUpdate(&pad);
+        u64 kDown = padGetButtonsDown(&pad);
+        if (kDown & HidNpadButton_A) { keep = true; waiting = false; }
+        if (kDown & HidNpadButton_B) { keep = false; waiting = false; }
+
+        SDL_SetRenderDrawColor(g_renderer, bg_fallback.r, bg_fallback.g, bg_fallback.b, 255);
+        SDL_RenderClear(g_renderer);
+        if (bg_tex) {
+            SDL_RenderCopy(g_renderer, bg_tex, NULL, NULL); // stretch to fill the screen
+        }
+
+        // Dim overlay so the mockup UI stays legible regardless of the
+        // background image's own brightness/contrast.
+        fill_rect(0, 0, SCREEN_W, SCREEN_H, (RGBA){ 0, 0, 0, 70 });
+
+        if (logo_tex) {
+            int lw = 0, lh = 0;
+            SDL_QueryTexture(logo_tex, NULL, NULL, &lw, &lh);
+            if (lh > 0) {
+                float s = 80.0f / lh;
+                SDL_Rect dst = { 40, 30, (int)(lw * s), 80 };
+                SDL_RenderCopy(g_renderer, logo_tex, NULL, &dst);
+            }
+        }
+
+        int gridX = 40, gridY = 150, gridW = SCREEN_W - 80, gridH = 420;
+        draw_rect_outline(gridX, gridY, gridW, gridH, border_color, 2);
+
+        int tileW = 170, tileH = 170, gap = 20, tilesPerRow = 6;
+        for (int i = 0; i < 12; i++) {
+            int col = i % tilesPerRow;
+            int row = i / tilesPerRow;
+            int tx = gridX + 20 + col * (tileW + gap);
+            int ty = gridY + 20 + row * (tileH + gap);
+            if (i == 4) { // one tile shown "selected", using the theme's real selection colors
+                fill_rect(tx, ty, tileW, tileH, sel_bg);
+                draw_rect_outline(tx, ty, tileW, tileH, sel_border, 3);
+            } else {
+                fill_rect(tx, ty, tileW, tileH, (RGBA){ 255, 255, 255, 18 });
+            }
+        }
+
+        int pbX = 40, pbY = 600, pbW = SCREEN_W - 80, pbH = 14;
+        fill_rect(pbX, pbY, pbW, pbH, progress_bg);
+        fill_rect(pbX, pbY, (int)(pbW * 0.64f), pbH, progress_color);
+
+        draw_text(40, 630, theme_name, text_sdl);
+        draw_text_small(40, 668, "A = Keep this theme        B = Remove it", hint_sdl);
+
+        SDL_RenderPresent(g_renderer);
+    }
+
+    if (bg_tex) SDL_DestroyTexture(bg_tex);
+    if (logo_tex) SDL_DestroyTexture(logo_tex);
+
+    return keep;
+}
+
+// ---- Menu screen --------------------------------------------------------------
+
+static void draw_menu(Theme *themes, int count, int cursor, int scroll, const char *status) {
+    SDL_SetRenderDrawColor(g_renderer, 11, 20, 32, 255);
+    SDL_RenderClear(g_renderer);
+
+    SDL_Color white  = { 234, 241, 250, 255 };
+    SDL_Color dim    = { 120, 138, 158, 255 };
+    SDL_Color accent = { 60, 200, 255, 255 };
+
+    draw_text(40, 26, "A-Theme Installer", white);
+    draw_text_small(40, 62, "Tinfoil theme downloader", dim);
+    fill_rect(40, 92, SCREEN_W - 80, 2, (RGBA){ 40, 60, 85, 255 });
+
+    if (count == 0) {
+        draw_text(40, 130, "No themes found in the manifest.", dim);
+    } else {
+        int y = 116;
+        int rowH = 34;
+        int end = scroll + PAGE_SIZE;
+        if (end > count) end = count;
+        for (int i = scroll; i < end; i++) {
+            if (i == cursor) {
+                fill_rect(30, y - 4, SCREEN_W - 60, rowH, (RGBA){ 60, 200, 255, 35 });
+                draw_text(50, y, themes[i].name, accent);
+            } else {
+                draw_text(50, y, themes[i].name, white);
+            }
+            y += rowH;
+        }
+        if (count > PAGE_SIZE) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "(%d/%d)", cursor + 1, count);
+            draw_text_small(40, y + 6, buf, dim);
+        }
+    }
+
+    fill_rect(40, SCREEN_H - 70, SCREEN_W - 80, 2, (RGBA){ 40, 60, 85, 255 });
+    if (status && status[0]) draw_text_small(40, SCREEN_H - 56, status, accent);
+    draw_text_small(40, SCREEN_H - 30, "A = Install    Y = Preview then install    + = Exit", dim);
+
+    SDL_RenderPresent(g_renderer);
+}
+
+// ---- Graphics init/shutdown ---------------------------------------------------
+
+static bool init_graphics(char *err, size_t errcap) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        snprintf(err, errcap, "SDL_Init failed: %s", SDL_GetError());
+        return false;
+    }
+    if (TTF_Init() != 0) {
+        snprintf(err, errcap, "TTF_Init failed: %s", TTF_GetError());
+        return false;
+    }
+    IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
+
+    if (SDL_CreateWindowAndRenderer(SCREEN_W, SCREEN_H, 0, &g_window, &g_renderer) != 0) {
+        snprintf(err, errcap, "SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
+        return false;
+    }
+    SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+
+    // Use Nintendo's own shared system font rather than bundling one — no
+    // extra file to ship, and it matches what the OS already renders
+    // elsewhere.
+    Result rc = plInitialize(PlServiceType_User);
+    if (R_FAILED(rc)) {
+        snprintf(err, errcap, "plInitialize failed: 0x%x", rc);
+        return false;
+    }
+    static PlFontData fontData;
+    rc = plGetSharedFontByType(&fontData, PlSharedFontType_Standard);
+    if (R_FAILED(rc)) {
+        snprintf(err, errcap, "plGetSharedFontByType failed: 0x%x", rc);
+        return false;
+    }
+
+    g_font = TTF_OpenFontRW(SDL_RWFromConstMem(fontData.address, fontData.size), 0, 26);
+    g_font_small = TTF_OpenFontRW(SDL_RWFromConstMem(fontData.address, fontData.size), 0, 18);
+    if (!g_font || !g_font_small) {
+        snprintf(err, errcap, "TTF_OpenFontRW failed: %s", TTF_GetError());
+        return false;
+    }
+
+    return true;
+}
+
+static void shutdown_graphics(void) {
+    if (g_font) TTF_CloseFont(g_font);
+    if (g_font_small) TTF_CloseFont(g_font_small);
+    plExit();
+    TTF_Quit();
+    IMG_Quit();
+    if (g_renderer) SDL_DestroyRenderer(g_renderer);
+    if (g_window) SDL_DestroyWindow(g_window);
+    SDL_Quit();
+}
+
+// ---- Entry point ------------------------------------------------------------
+
+int main(int argc, char **argv) {
+    romfsInit(); // mounts the bundled cacert.pem for TLS verification
     socketInitializeDefault();
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    printf("A-Theme Installer\nFetching theme list...\n");
-    consoleUpdate(NULL);
+    char graphics_err[160] = "";
+    if (!init_graphics(graphics_err, sizeof(graphics_err))) {
+        // Nothing to render without graphics — nowhere good to show this
+        // error, so there's genuinely nothing more this app can do.
+        shutdown_graphics();
+        curl_global_cleanup();
+        socketExit();
+        romfsExit();
+        return 1;
+    }
+
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&pad);
+
+    draw_menu(NULL, 0, 0, 0, "Fetching theme list...");
 
     Theme *themes = malloc(sizeof(Theme) * MAX_THEMES);
     int themeCount = 0;
@@ -682,29 +898,25 @@ int main(int argc, char **argv) {
     }
 
     if (!gotManifest || !parsedOk || themeCount == 0) {
-        printf("\nCould not load the theme list.\n");
+        char msg[200];
         if (gotManifest && !parsedOk) {
-            printf("Connected fine, but couldn't find a \"themes\" list in\n"
-                   "the manifest -- it may have changed format.\n");
+            snprintf(msg, sizeof(msg), "Manifest format not recognized. Press + to exit.");
         } else if (!gotManifest && http_code != 0) {
-            printf("Server responded with HTTP %ld while fetching:\n%s\n", http_code, MANIFEST_URL);
+            snprintf(msg, sizeof(msg), "Server error %ld fetching theme list. Press + to exit.", http_code);
         } else {
-            printf("Check that your Switch is connected to Wi-Fi.\n");
+            snprintf(msg, sizeof(msg), "Could not connect. Check Wi-Fi, then press + to exit.");
         }
-        printf("\nPress + to exit.\n");
-        consoleUpdate(NULL);
-        while (appletMainLoop()) {
+
+        bool waiting = true;
+        while (appletMainLoop() && waiting) {
             padUpdate(&pad);
-            if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
-            consoleUpdate(NULL);
+            if (padGetButtonsDown(&pad) & HidNpadButton_Plus) waiting = false;
+            draw_menu(NULL, 0, 0, 0, msg);
         }
     } else {
         int cursor = 0, scroll = 0, statusTimer = 0;
         char statusMsg[220] = "";
         bool running = true;
-
-        render_menu(themes, themeCount, cursor, scroll, statusMsg);
-        consoleUpdate(NULL);
 
         while (appletMainLoop() && running) {
             padUpdate(&pad);
@@ -724,8 +936,7 @@ int main(int argc, char **argv) {
                 Theme *t = &themes[cursor];
 
                 snprintf(statusMsg, sizeof(statusMsg), "Installing \"%s\"...", t->name);
-                render_menu(themes, themeCount, cursor, scroll, statusMsg);
-                consoleUpdate(NULL);
+                draw_menu(themes, themeCount, cursor, scroll, statusMsg);
 
                 char detail[128] = "";
                 bool ok = install_theme(t, detail, sizeof(detail));
@@ -739,31 +950,16 @@ int main(int argc, char **argv) {
                     char dest_dir[300];
                     snprintf(dest_dir, sizeof(dest_dir), THEMES_ROOT "%s", t->folder);
 
-                    char *img_data = NULL;
-                    size_t img_size = 0;
-                    if (find_preview_image_bytes(dest_dir, &img_data, &img_size)) {
-                        bool keep = show_preview_and_confirm(img_data, img_size, t->name);
-                        free(img_data);
-
-                        if (keep) {
-                            snprintf(statusMsg, sizeof(statusMsg),
-                                "Installed \"%s\" -- pick it in Tinfoil's theme settings.", t->name);
-                        } else {
-                            remove_dir_recursive(dest_dir);
-                            snprintf(statusMsg, sizeof(statusMsg), "Removed \"%s\".", t->name);
-                        }
-                    } else {
-                        // Installed fine, just nothing to preview (no
-                        // background.image or logo field, or it couldn't
-                        // be fetched/decoded) — leave it installed.
+                    bool keep = show_theme_preview_and_confirm(dest_dir, t->name);
+                    if (keep) {
                         snprintf(statusMsg, sizeof(statusMsg),
-                            "Installed \"%s\" (no preview available) -- pick it in Tinfoil's theme settings.", t->name);
+                            "Installed \"%s\" -- pick it in Tinfoil's theme settings.", t->name);
+                    } else {
+                        remove_dir_recursive(dest_dir);
+                        snprintf(statusMsg, sizeof(statusMsg), "Removed \"%s\".", t->name);
                     }
-
-                    render_menu(themes, themeCount, cursor, scroll, statusMsg);
-                    consoleUpdate(NULL);
                 }
-                statusTimer = 240; // ~4 seconds at 60fps
+                statusTimer = 240;
             }
 
             if (cursor < scroll) scroll = cursor;
@@ -774,15 +970,14 @@ int main(int argc, char **argv) {
                 if (statusTimer == 0) statusMsg[0] = '\0';
             }
 
-            render_menu(themes, themeCount, cursor, scroll, statusMsg);
-            consoleUpdate(NULL);
+            draw_menu(themes, themeCount, cursor, scroll, statusMsg);
         }
     }
 
     free(themes);
+    shutdown_graphics();
     curl_global_cleanup();
     socketExit();
     romfsExit();
-    consoleExit(NULL);
     return 0;
 }
