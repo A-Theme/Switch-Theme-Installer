@@ -1,30 +1,24 @@
 # Building A-Theme Installer
 
-> **Heads up:** this source was written carefully against the documented
-> libnx/curl-for-Switch APIs, but it has **not been compiled or run on real
-> hardware** — the sandboxed environment this was written in blocks access
-> to devkitPro's servers entirely, so there was no way to test-build it here.
-> Treat this as a solid first draft. Expect to fix a handful of small
-> compile issues (a missing include, a slightly off API signature, etc.) on
-> your first `make` — that's completely normal for homebrew and not a sign
-> anything is fundamentally wrong with the approach.
-
-## What this is
-
-A minimal on-console app: it fetches a plain-text list of themes from your
-GitHub repo, shows them as a menu, and installs whichever one you pick
-straight onto the SD card in Tinfoil's expected folder layout
-(`sdmc:/switch/tinfoil/themes/<folder>/theme.json`). It deliberately does
-**not** try to reproduce the visual editor — that stays a browser/desktop
-tool, since a console controller is a bad fit for color pickers and text
-input. This app's whole job is browse → download → install.
+> **Status, honestly:** this project has a real track record at this
+> point — the original plain-text-manifest version was successfully built
+> on a real Windows devkitPro install (confirmed working `.nro`, no
+> compile errors), and the JSON-parsing logic in every version since has
+> been compiled and run for real on a PC against actual A-Theme content
+> before being written into this app.
+>
+> This version adds a **preview screen** (see and confirm a theme's look
+> before keeping it installed), which needed real graphics for the first
+> time — `switch-sdl2` + `switch-sdl2_image`. That part is new, Switch-
+> specific, and **could not be tested** in the environment this was
+> written in. It's flagged clearly in Troubleshooting below, with the
+> exact spot most likely to need real debugging on hardware.
 
 ## 1. Install devkitPro
 
 Follow the official installer for your OS: <https://devkitpro.org/wiki/Getting_Started>
 
-Make sure `DEVKITPRO` and `DEVKITA64` end up set in your environment (the
-installer does this for you on most platforms). Verify with:
+Verify `DEVKITPRO` is set:
 
 ```bash
 echo $DEVKITPRO
@@ -34,42 +28,38 @@ echo $DEVKITPRO
 ## 2. Install the required packages
 
 ```bash
-# Linux/macOS (dkp-pacman ships with the devkitPro installer)
-sudo dkp-pacman -S switch-dev switch-curl switch-mbedtls switch-zlib
+# Linux/macOS
+sudo dkp-pacman -S switch-dev switch-curl switch-mbedtls switch-zlib switch-zziplib switch-sdl2 switch-sdl2_image
 
-# Windows (MSYS2 shell that the devkitPro installer sets up)
-pacman -S switch-dev switch-curl switch-mbedtls switch-zlib
+# Windows (the MSYS2 shell the devkitPro installer sets up)
+pacman -S switch-dev switch-curl switch-mbedtls switch-zlib switch-zziplib switch-sdl2 switch-sdl2_image
 ```
 
-- `switch-dev` — the core libnx/devkitA64 toolchain package group
-- `switch-curl` — libcurl built for the Switch (what this app uses for HTTPS)
-- `switch-mbedtls` / `switch-zlib` — curl's own dependencies on this platform
+- `switch-dev` — core libnx/devkitA64 toolchain
+- `switch-curl` / `switch-mbedtls` / `switch-zlib` — HTTPS downloads
+- `switch-zziplib` — reads the downloaded `.zip` theme archives
+- `switch-sdl2` / `switch-sdl2_image` — **new in this version**, used only
+  for the preview screen (decoding + displaying a theme's background
+  image/logo)
 
 ## 3. Add the CA certificate bundle
-
-libcurl needs a certificate bundle to actually verify HTTPS connections
-(rather than blindly trusting whatever responds) — this app is written to
-require it rather than silently disabling verification, since it's writing
-files to your SD card based on what it downloads.
 
 ```bash
 mkdir -p romfs
 curl -o romfs/cacert.pem https://curl.se/ca/cacert.pem
 ```
 
-(Any current CA bundle works — that's just the standard, well-known source
-Mozilla/curl publish.) This file gets embedded into the `.nro` at build time
-via the `ROMFS` directory and is not something you need to ship separately.
+Needed so HTTPS downloads are actually verified rather than blindly
+trusted. Gets embedded into the `.nro` via the `ROMFS` directory.
 
 ## 4. Build
-
-From this folder:
 
 ```bash
 make
 ```
 
-If it succeeds, you'll get `a-theme-installer.nro` in this same folder.
+Produces `a-theme-installer.nro` (plus `.nacp`/`.elf` artifacts you can
+ignore) in this folder.
 
 ## 5. Install on your Switch
 
@@ -79,35 +69,67 @@ Copy the `.nro` to:
 sdmc:/switch/a-theme-installer/a-theme-installer.nro
 ```
 
-(any subfolder under `sdmc:/switch/` works — the Homebrew Menu scans all of
-them). Launch it from the Homebrew Menu (via a jailed exploit or, if you're
-running a CFW like Atmosphère, directly from the Switch's Album applet using
-the Homebrew Menu takeover, exactly like you'd launch Tinfoil itself).
+Launch from the Homebrew Menu.
+
+## How it works
+
+- **A** on a highlighted theme installs it immediately, no preview.
+- **Y** installs it, then shows a fullscreen preview of its background
+  image (or logo, if no background image is set) — **A** keeps it, **B**
+  removes it again. Either way, the theme is briefly, actually installed
+  during the preview (there's no separate "download just a thumbnail"
+  path available from the current manifest, since it only lists full
+  theme `.zip`s) — choosing not to keep it just deletes what was written.
+
+The manifest itself (`themes.json`) is fetched fresh from
+`A-Theme/Tinfoil-Themes` every launch — nothing to maintain separately for
+this app to work.
 
 ## Troubleshooting notes for whoever compiles this first
 
-A few things worth checking if the build or the app itself misbehaves,
-since I couldn't verify any of this against a real compiler or console:
+Roughly in order of how likely each one is to actually come up:
 
-- **`HidNpadButton_*` names** — libnx has renamed/reorganized its pad-input
-  API a few times across versions. If these don't resolve, check
+- **The SDL2/console handoff (`show_preview_and_confirm()` in main.c) —
+  the single riskiest piece in this app.** It calls `consoleExit()` to
+  release libnx's text console, then `SDL_Init(SDL_INIT_VIDEO)` to hand
+  the display to SDL2, and reverses that afterward. Both ultimately
+  compete for the same underlying display surface. If the preview screen
+  shows nothing, shows garbage, or the app hangs/crashes specifically
+  when entering or leaving the preview (menu navigation working fine
+  otherwise), start here. Likely fixes if it misbehaves:
+  - Try removing the `consoleExit()`/`consoleInit()` calls around the
+    preview and see if SDL2 can coexist with the console left "open" —
+    some libnx SDL2 setups tolerate this fine, some don't.
+  - Check `$DEVKITPRO/portlibs/switch/include/SDL2/` to confirm the
+    actual installed API matches what's called here (`SDL_CreateWindowAndRenderer`,
+    `IMG_Load_RW`, etc.) — these are standard SDL2 calls that shouldn't
+    have changed, but versions do drift.
+- **`pkg-config: command not found` / `aarch64-none-elf-pkg-config` not
+  found** — confirm `switch-sdl2` actually installed and that
+  devkitA64's `bin/` is on your `PATH` (the devkitPro installer usually
+  handles this, but a fresh MSYS2 shell occasionally needs re-sourcing
+  its profile).
+- **`ZZIP_DIR` / `zzip_dir_open` not found** — confirm `switch-zziplib`
+  installed (`pacman -Qs zziplib`), and check
+  `$DEVKITPRO/portlibs/switch/include/zzip/` for the actual header name —
+  some versions use `<zzip/lib.h>` instead of `<zzip/zzip.h>`.
+- **Cert verification fails at runtime** (downloads fail even though the
+  build succeeded) — `CURLOPT_CAINFO` is set to `"romfs:/cacert.pem"`,
+  assuming libcurl's Switch port resolves `romfs:` paths the same way
+  `sdmc:` is resolved. If not, `CURLOPT_CAINFO_BLOB` with the cert loaded
+  into memory is the fallback.
+- **`HidNpadButton_*` names don't resolve** — libnx has renamed/
+  reorganized pad-input enums a few times. Check
   `switch/include/switch/services/hid.h` in your installed libnx for the
-  current enum names and swap them in.
-- **`curl_easy_setopt(..., CURLOPT_CAINFO, "romfs:/cacert.pem")`** — this
-  assumes libcurl's Switch port resolves `romfs:` paths through the same
-  devoptab virtual filesystem `sdmc:` uses. If cert verification fails at
-  runtime, this is the first thing to check — some builds may need an
-  absolute in-memory path via `CURLOPT_CAINFO_BLOB` instead.
-- **`strtok_r`** — should be available via devkitA64's newlib, but if the
-  linker complains, swap in plain `strtok` (this app doesn't use threads,
-  so it isn't strictly needed here — `strtok_r` was just used to be safe).
-- **Network before Wi-Fi is actually connected** — if the Switch hasn't
-  joined a network yet, `http_get()` will just fail and the app shows the
-  "check your Wi-Fi" screen. That's expected behavior, not a bug.
+  current names.
+- **Preview shows the wrong image, or a stretched/squished one** — the
+  scaling math in `show_preview_and_confirm()` is simple
+  aspect-preserving fit-to-screen; if something looks off, it's more
+  likely a bug there than in SDL2 itself, and should be quick to spot by
+  printing `surface->w`/`surface->h` before the fit calculation.
 
-## Updating the theme list later
+## Updating later
 
-Nothing in the app itself needs rebuilding when you add new themes — it
-reads `themes.txt` fresh over the network every time it launches. Just edit
-`https://github.com/A-Theme/Tinfoil-Themes/blob/main/themes.txt` (see
-`manifest-example/themes.txt` in this folder for the format) and push.
+Nothing about this app needs rebuilding when themes are added, removed, or
+changed — it reads `themes.json` and each theme's `theme.json` fresh over
+the network every time, so your existing publishing workflow just works.

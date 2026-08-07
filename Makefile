@@ -35,15 +35,28 @@ ROMFS       := romfs
 
 ARCH    := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 
+# SDL2 + SDL2_image are used only for the preview screen. Following
+# devkitPro's own official example pattern here (switch-examples'
+# graphics/sdl2/sdl2-simple/Makefile) rather than hand-listing the full
+# transitive link chain (EGL, drm_nouveau, libpng, libjpeg-turbo, etc.) —
+# pkg-config resolves whatever your installed portlib versions actually
+# need, which is far less likely to go stale or be wrong than a hardcoded
+# list would be.
+PKGCONF := aarch64-none-elf-pkg-config
+PC_LIBS := sdl2 SDL2_image
+
 CFLAGS  := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES)
 CFLAGS  += $(INCLUDE) -D__SWITCH__
+CFLAGS  += `$(PKGCONF) --cflags $(PC_LIBS)`
 CXXFLAGS    := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++20
 
 ASFLAGS := -g $(ARCH)
 LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # curl needs mbedtls (TLS) and zlib (compression) underneath it on Switch.
-LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lnx
+# zziplib reads the downloaded .zip theme archives, and itself needs zlib too.
+LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lzzip -lz \
+           `$(PKGCONF) --libs $(PC_LIBS)` -lnx
 
 #---------------------------------------------------------------------------------
 # Library / portlib search paths
