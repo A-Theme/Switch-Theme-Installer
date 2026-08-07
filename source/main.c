@@ -52,6 +52,7 @@
 #include <strings.h> // strcasecmp
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h> // rmdir()
 #include <stdbool.h>
 
 #define JSMN_STATIC
@@ -427,11 +428,20 @@ static bool extract_zip(const char *zip_path, const char *dest_dir, bool *found_
         zzip_file_close(zf);
 
         if (read_ok) {
+            // A-Theme's zips package the config file as "settings.json" (real
+            // theme files from this project have always used that name), but
+            // Tinfoil itself reads "theme.json" from the SD card. Normalize
+            // whichever one we find to the name Tinfoil actually expects —
+            // everything else keeps its original filename.
+            bool is_config = (strcasecmp(base, "theme.json") == 0 ||
+                               strcasecmp(base, "settings.json") == 0);
+            const char *dest_name = is_config ? "theme.json" : base;
+
             char dest_path[600];
-            snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, base);
+            snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, dest_name);
             if (write_file(dest_path, buf, used)) {
                 extracted_any = true;
-                if (strcasecmp(base, "theme.json") == 0) *found_theme_json = true;
+                if (is_config) *found_theme_json = true;
             }
         }
         free(buf);
@@ -473,7 +483,7 @@ static bool install_theme(const Theme *t, char *status_detail, size_t status_cap
         return false;
     }
     if (!found_theme_json) {
-        snprintf(status_detail, status_cap, "Installed, but no theme.json found inside the zip");
+        snprintf(status_detail, status_cap, "Installed, but no theme.json/settings.json found inside the zip");
         return false;
     }
 
