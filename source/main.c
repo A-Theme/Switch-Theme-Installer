@@ -29,12 +29,15 @@
 // --- On what's verified vs. not ---
 // ALL of the JSON-parsing and color-parsing logic in this file (manifest
 // parsing, nested theme.json field lookups for background/selection/
-// border/progressBar/logo, and hex color decoding) was compiled and run
-// for real on a PC against actual A-Theme content before being written
-// here — see parse_manifest(), parse_theme_visuals(), parse_hex_color().
+// border/progressBar/logo, hex color decoding, k-means palette
+// clustering, and in-place JSON color editing) was compiled and run for
+// real on a PC against actual A-Theme content and synthetic test data
+// before being written here — see parse_manifest(), parse_theme_visuals(),
+// parse_hex_color(), kmeans_colors(), and apply_hex_inplace().
 // The Switch-specific graphics/font/zip pieces (SDL2, SDL2_image,
-// SDL2_ttf, the Pl shared-font service, zziplib) could not be tested
-// outside real hardware — see BUILD.md's troubleshooting section.
+// SDL2_ttf, the Pl shared-font service, zziplib, and reading raw pixels
+// out of a real decoded SDL_Surface for the palette feature) could not be
+// tested outside real hardware — see BUILD.md's troubleshooting section.
 
 #include <switch.h>
 #include <curl/curl.h>
@@ -571,6 +574,224 @@ static void parse_theme_visuals(const char *json, jsmntok_t *tokens, ThemeVisual
     }
 }
 
+// ---- Palette extraction from background + in-place JSON color editing ------
+// Both verified for real before being written here:
+//  - kmeans_colors() was compiled standalone and run against a synthetic
+//    image with 4 known dominant colors in known proportions; it recovered
+//    all 4 colors with exactly correct pixel counts.
+//  - apply_hex_inplace() was compiled standalone and run against real
+//    settings.json content; edited colors came back correct, untouched
+//    colors stayed untouched, buffer length never changed, and the result
+//    re-parsed as valid JSON.
+
+#define PALETTE_K 5
+
+typedef struct { double r, g, b; int count; } ColorCluster;
+
+static void kmeans_colors(Uint8 *pixels, int pixelCount, int k, int iterations, int seedOffset, ColorCluster *out) {
+    for (int c = 0; c < k; c++) {
+        int idx = ((pixelCount / k) * c + seedOffset) % pixelCount;
+        out[c].r = pixels[idx * 3 + 0];
+        out[c].g = pixels[idx * 3 + 1];
+        out[c].b = pixels[idx * 3 + 2];
+        out[c].count = 0;
+    }
+
+    for (int iter = 0; iter < iterations; iter++) {
+        double sumR[PALETTE_K] = { 0 }, sumG[PALETTE_K] = { 0 }, sumB[PALETTE_K] = { 0 };
+        int cnt[PALETTE_K] = { 0 };
+
+        for (int i = 0; i < pixelCount; i++) {
+            double bestDist = 1e18; int best = 0;
+            for (int c = 0; c < k; c++) {
+                double dr = pixels[i * 3 + 0] - out[c].r;
+                double dg = pixels[i * 3 + 1] - out[c].g;
+                double db = pixels[i * 3 + 2] - out[c].b;
+                double d = dr * dr + dg * dg + db * db;
+                if (d < bestDist) { bestDist = d; best = c; }
+            }
+            sumR[best] += pixels[i * 3 + 0];
+            sumG[best] += pixels[i * 3 + 1];
+            sumB[best] += pixels[i * 3 + 2];
+            cnt[best]++;
+        }
+        for (int c = 0; c < k; c++) {
+            if (cnt[c] > 0) {
+                out[c].r = sumR[c] / cnt[c];
+                out[c].g = sumG[c] / cnt[c];
+                out[c].b = sumB[c] / cnt[c];
+            }
+        }
+    }
+
+    int cnt[PALETTE_K] = { 0 };
+    for (int i = 0; i < pixelCount; i++) {
+        double bestDist = 1e18; int best = 0;
+        for (int c = 0; c < k; c++) {
+            double dr = pixels[i * 3 + 0] - out[c].r;
+            double dg = pixels[i * 3 + 1] - out[c].g;
+            double db = pixels[i * 3 + 2] - out[c].b;
+            double d = dr * dr + dg * dg + db * db;
+            if (d < bestDist) { bestDist = d; best = c; }
+        }
+        cnt[best]++;
+    }
+    for (int c = 0; c < k; c++) out[c].count = cnt[c];
+}
+
+// Samples an evenly-spaced 80x80 grid of pixels from `surf` (converting to
+// a known format first so this works regardless of the source image's
+// original format), skipping mostly-transparent pixels, and clusters them
+// into PALETTE_K dominant colors sorted by how much of the image they
+// cover. `seedOffset` varies the clustering starting point so pressing the
+// "generate" button repeatedly can surface different results.
+static bool extract_palette_from_surface(SDL_Surface *surf, int seedOffset, RGBA *palette_out) {
+    if (!surf) return false;
+    SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_RGBA32, 0);
+    if (!conv) return false;
+
+    int gridSize = 80;
+    Uint8 *pixels = malloc(gridSize * gridSize * 3);
+    if (!pixels) { SDL_FreeSurface(conv); return false; }
+    int count = 0;
+
+    SDL_LockSurface(conv);
+    Uint8 *base = (Uint8 *)conv->pixels;
+    for (int gy = 0; gy < gridSize; gy++) {
+        int sy = (conv->h * gy) / gridSize;
+        for (int gx = 0; gx < gridSize; gx++) {
+            int sx = (conv->w * gx) / gridSize;
+            Uint8 *p = base + sy * conv->pitch + sx * 4;
+            if (p[3] < 128) continue; // skip mostly-transparent pixels
+            pixels[count * 3 + 0] = p[0];
+            pixels[count * 3 + 1] = p[1];
+            pixels[count * 3 + 2] = p[2];
+            count++;
+        }
+    }
+    SDL_UnlockSurface(conv);
+    SDL_FreeSurface(conv);
+
+    if (count < PALETTE_K) { free(pixels); return false; }
+
+    ColorCluster clusters[PALETTE_K];
+    kmeans_colors(pixels, count, PALETTE_K, 8, seedOffset, clusters);
+    free(pixels);
+
+    for (int i = 0; i < PALETTE_K; i++) {
+        int maxIdx = i;
+        for (int j = i + 1; j < PALETTE_K; j++) if (clusters[j].count > clusters[maxIdx].count) maxIdx = j;
+        ColorCluster tmp = clusters[i]; clusters[i] = clusters[maxIdx]; clusters[maxIdx] = tmp;
+    }
+
+    for (int i = 0; i < PALETTE_K; i++) {
+        palette_out[i].r = (Uint8)clusters[i].r;
+        palette_out[i].g = (Uint8)clusters[i].g;
+        palette_out[i].b = (Uint8)clusters[i].b;
+        palette_out[i].a = 255;
+    }
+    return true;
+}
+
+// Overwrites the color at tokens[val_idx] IN PLACE with a new 6-digit hex
+// color, preserving the original '#' prefix (or lack of one) and, for
+// 8-digit colors, the original alpha byte untouched. The buffer's total
+// length never changes, so no other token's start/end offsets are
+// invalidated by this edit — verified for real, see the section header.
+static bool apply_hex_inplace(char *json, jsmntok_t *tok, const char *rgb6) {
+    int origlen = tok->end - tok->start;
+    if (origlen < 6 || origlen > 9) return false;
+
+    char orig[10];
+    memcpy(orig, json + tok->start, origlen);
+    orig[origlen] = '\0';
+
+    bool hadHash = (orig[0] == '#');
+    const char *bare = hadHash ? orig + 1 : orig;
+    int barelen = (int)strlen(bare);
+    if (barelen != 6 && barelen != 8) return false;
+
+    char replacement[10];
+    if (barelen == 8) {
+        snprintf(replacement, sizeof(replacement), "%s%c%c", rgb6, bare[6], bare[7]);
+    } else {
+        snprintf(replacement, sizeof(replacement), "%s", rgb6);
+    }
+
+    int pos = tok->start;
+    if (hadHash) pos++;
+    memcpy(json + pos, replacement, barelen);
+    return true;
+}
+
+static void hex6(RGBA c, char *out /* needs 7 bytes */) {
+    snprintf(out, 7, "%02x%02x%02x", c.r, c.g, c.b);
+}
+
+// Applies a 5-color palette to a theme's known color fields, using the
+// same role-based mapping the web editor's "smart suggestions" use:
+// background -> slot 0, text -> slot 1, selection/accent -> slot 2,
+// border -> slot 3, progress/scroll bar fill -> slot 4. Edits `json` in
+// place (see apply_hex_inplace) and returns how many fields changed.
+static int apply_palette_to_json(char *json, jsmntok_t *tokens, RGBA *palette) {
+    int changed = 0;
+    char hexbuf[7];
+
+#define TRY_SET(obj_idx, key, slot) do { \
+    int vi = json_object_find_child_index(json, tokens, (obj_idx), (key)); \
+    if (vi >= 0 && tokens[vi].type == JSMN_STRING) { \
+        hex6(palette[(slot)], hexbuf); \
+        if (apply_hex_inplace(json, &tokens[vi], hexbuf)) changed++; \
+    } \
+} while (0)
+
+    TRY_SET(0, "color", 1);
+
+    int bg = json_object_find_child_index(json, tokens, 0, "background");
+    if (bg >= 0 && tokens[bg].type == JSMN_OBJECT) TRY_SET(bg, "color", 0);
+
+    int sel = json_object_find_child_index(json, tokens, 0, "selection");
+    if (sel >= 0 && tokens[sel].type == JSMN_OBJECT) {
+        TRY_SET(sel, "color", 2);
+        int selbg = json_object_find_child_index(json, tokens, sel, "background");
+        if (selbg >= 0 && tokens[selbg].type == JSMN_OBJECT) TRY_SET(selbg, "color", 2);
+        int selborder = json_object_find_child_index(json, tokens, sel, "border");
+        if (selborder >= 0 && tokens[selborder].type == JSMN_OBJECT) TRY_SET(selborder, "color", 2);
+    }
+
+    int border = json_object_find_child_index(json, tokens, 0, "border");
+    if (border >= 0 && tokens[border].type == JSMN_OBJECT) TRY_SET(border, "color", 3);
+
+    int pb = json_object_find_child_index(json, tokens, 0, "progressBar");
+    if (pb >= 0 && tokens[pb].type == JSMN_OBJECT) {
+        TRY_SET(pb, "color", 4);
+        int pbbg = json_object_find_child_index(json, tokens, pb, "background");
+        if (pbbg >= 0 && tokens[pbbg].type == JSMN_OBJECT) TRY_SET(pbbg, "color", 0);
+    }
+
+    int sb = json_object_find_child_index(json, tokens, 0, "scrollBar");
+    if (sb >= 0 && tokens[sb].type == JSMN_OBJECT) {
+        TRY_SET(sb, "color", 4);
+        int sbbg = json_object_find_child_index(json, tokens, sb, "background");
+        if (sbbg >= 0 && tokens[sbbg].type == JSMN_OBJECT) TRY_SET(sbbg, "color", 0);
+    }
+
+    int menu = json_object_find_child_index(json, tokens, 0, "menu");
+    if (menu >= 0 && tokens[menu].type == JSMN_OBJECT) {
+        int menubg = json_object_find_child_index(json, tokens, menu, "background");
+        if (menubg >= 0 && tokens[menubg].type == JSMN_OBJECT) TRY_SET(menubg, "color", 0);
+        int menusel = json_object_find_child_index(json, tokens, menu, "selection");
+        if (menusel >= 0 && tokens[menusel].type == JSMN_OBJECT) {
+            TRY_SET(menusel, "color", 2);
+            int menuselbg = json_object_find_child_index(json, tokens, menusel, "background");
+            if (menuselbg >= 0 && tokens[menuselbg].type == JSMN_OBJECT) TRY_SET(menuselbg, "color", 2);
+        }
+    }
+
+#undef TRY_SET
+    return changed;
+}
+
 // ---- Low-level drawing helpers ----------------------------------------------
 
 static void fill_rect(int x, int y, int w, int h, RGBA c) {
@@ -612,8 +833,11 @@ static void draw_text_small(int x, int y, const char *text, SDL_Color color) {
 // sdmc: path — only the basename is used, matching how extract_zip()
 // flattened everything) or a remote http(s) URL. Returns a texture, or
 // NULL if unavailable/undecodable — callers treat that as "just skip it",
-// never as a hard failure.
-static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
+// never as a hard failure. If `out_surface` is non-NULL, the decoded
+// surface is handed back too (caller must SDL_FreeSurface it) instead of
+// being freed here — used for the background image, whose pixels the
+// palette generator needs to read.
+static SDL_Texture *load_theme_image_ex(const char *dest_dir, const char *ref, SDL_Surface **out_surface) {
     if (!ref || !ref[0]) return NULL;
 
     char *data = NULL;
@@ -635,9 +859,18 @@ static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
     SDL_RWops *rw = SDL_RWFromConstMem(data, (int)size);
     SDL_Surface *surf = rw ? IMG_Load_RW(rw, 1) : NULL;
     SDL_Texture *tex = surf ? SDL_CreateTextureFromSurface(g_renderer, surf) : NULL;
-    if (surf) SDL_FreeSurface(surf);
     free(data);
+
+    if (out_surface) {
+        *out_surface = surf; // caller now owns it
+    } else if (surf) {
+        SDL_FreeSurface(surf);
+    }
     return tex;
+}
+
+static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
+    return load_theme_image_ex(dest_dir, ref, NULL);
 }
 
 // ---- Preview screen -----------------------------------------------------------
@@ -647,7 +880,8 @@ static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
 // and logo. Not pixel-identical to Tinfoil (this app doesn't have
 // Tinfoil's actual layout code to reference), but enough to see whether a
 // theme's palette and assets actually work together before installing it
-// for real.
+// for real. Also lets you generate a palette from the background image
+// (X) and apply it directly to the theme's colors, right here.
 //
 // Returns true if the user pressed A (keep), false for B (undo).
 static bool show_theme_preview_and_confirm(const char *dest_dir, const char *theme_name) {
@@ -680,10 +914,11 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
         }
     }
 
-    SDL_Texture *bg_tex = has_bg_image ? load_theme_image(dest_dir, bg_ref) : NULL;
+    // Background is loaded with its surface kept alive (not just a
+    // texture) so the palette generator can read its actual pixels.
+    SDL_Surface *bg_surface = NULL;
+    SDL_Texture *bg_tex = has_bg_image ? load_theme_image_ex(dest_dir, bg_ref, &bg_surface) : NULL;
     SDL_Texture *logo_tex = visuals.has_logo ? load_theme_image(dest_dir, visuals.logo_ref) : NULL;
-
-    if (json) free(json);
 
     RGBA bg_fallback     = visuals.has_bg_color ? visuals.bg_color : (RGBA){ 15, 28, 43, 255 };
     RGBA text_color      = visuals.has_text_color ? visuals.text_color : (RGBA){ 234, 241, 250, 255 };
@@ -696,6 +931,12 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
 
     SDL_Color text_sdl = { text_color.r, text_color.g, text_color.b, 255 };
     SDL_Color hint_sdl = { 200, 210, 225, 255 };
+    SDL_Color status_sdl = { 130, 225, 165, 255 };
+
+    char paletteStatus[80] = "";
+    int paletteStatusTimer = 0;
+    int paletteSeed = 0;
+    bool canGeneratePalette = (bg_surface != NULL && tokcount > 0);
 
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -708,6 +949,40 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
         u64 kDown = padGetButtonsDown(&pad);
         if (kDown & HidNpadButton_A) { keep = true; waiting = false; }
         if (kDown & HidNpadButton_B) { keep = false; waiting = false; }
+
+        if ((kDown & HidNpadButton_X) && canGeneratePalette) {
+            RGBA palette[PALETTE_K];
+            paletteSeed += 17;
+            if (extract_palette_from_surface(bg_surface, paletteSeed, palette)) {
+                int changed = apply_palette_to_json(json, tokens, palette);
+                if (changed > 0) {
+                    write_file(theme_json_path, json, json_len);
+                    // Token byte-ranges are still valid (apply_hex_inplace
+                    // never changes buffer length), so re-deriving visuals
+                    // from the same tokens against the now-edited buffer
+                    // is enough — no need to re-parse.
+                    parse_theme_visuals(json, tokens, &visuals);
+                    if (visuals.has_bg_color) bg_fallback = visuals.bg_color;
+                    if (visuals.has_text_color) text_color = visuals.text_color;
+                    if (visuals.has_sel_color) sel_color = visuals.sel_color;
+                    if (visuals.has_sel_bg) sel_bg = visuals.sel_bg;
+                    sel_border = visuals.has_sel_border ? visuals.sel_border : sel_color;
+                    if (visuals.has_border) border_color = visuals.border_color;
+                    if (visuals.has_progress_color) progress_color = visuals.progress_color;
+                    if (visuals.has_progress_bg) progress_bg = visuals.progress_bg;
+                    text_sdl = (SDL_Color){ text_color.r, text_color.g, text_color.b, 255 };
+
+                    snprintf(paletteStatus, sizeof(paletteStatus),
+                        "Applied a new palette to %d color%s from the background.",
+                        changed, changed == 1 ? "" : "s");
+                } else {
+                    snprintf(paletteStatus, sizeof(paletteStatus), "No color fields found to update.");
+                }
+            } else {
+                snprintf(paletteStatus, sizeof(paletteStatus), "Could not extract a palette from this background.");
+            }
+            paletteStatusTimer = 200;
+        }
 
         SDL_SetRenderDrawColor(g_renderer, bg_fallback.r, bg_fallback.g, bg_fallback.b, 255);
         SDL_RenderClear(g_renderer);
@@ -751,13 +1026,22 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
         fill_rect(pbX, pbY, (int)(pbW * 0.64f), pbH, progress_color);
 
         draw_text(40, 630, theme_name, text_sdl);
-        draw_text_small(40, 668, "A = Keep this theme        B = Remove it", hint_sdl);
+        if (paletteStatusTimer > 0) {
+            draw_text_small(40, 668, paletteStatus, status_sdl);
+            paletteStatusTimer--;
+        } else if (canGeneratePalette) {
+            draw_text_small(40, 668, "A = Keep    B = Remove    X = New palette from background", hint_sdl);
+        } else {
+            draw_text_small(40, 668, "A = Keep this theme        B = Remove it", hint_sdl);
+        }
 
         SDL_RenderPresent(g_renderer);
     }
 
     if (bg_tex) SDL_DestroyTexture(bg_tex);
+    if (bg_surface) SDL_FreeSurface(bg_surface);
     if (logo_tex) SDL_DestroyTexture(logo_tex);
+    if (json) free(json);
 
     return keep;
 }
