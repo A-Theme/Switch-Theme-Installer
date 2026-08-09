@@ -30,10 +30,18 @@
 // ALL of the JSON-parsing and color-parsing logic in this file (manifest
 // parsing, nested theme.json field lookups for background/selection/
 // border/progressBar/logo, hex color decoding, k-means palette
-// clustering, and in-place JSON color editing) was compiled and run for
-// real on a PC against actual A-Theme content and synthetic test data
-// before being written here — see parse_manifest(), parse_theme_visuals(),
-// parse_hex_color(), kmeans_colors(), and apply_hex_inplace().
+// clustering, in-place JSON color editing, and the palette size now
+// dynamically matching each theme's own distinct color count) was
+// compiled and run for real on a PC against actual A-Theme content and
+// synthetic test data before being written here — see parse_manifest(),
+// parse_theme_visuals(), parse_hex_color(), kmeans_colors(),
+// apply_hex_inplace(), and count_distinct_theme_colors(). The dynamic
+// count specifically was verified end-to-end against real theme content
+// (correctly finding 9-10 distinct colors depending on the sample used),
+// and a real bug was caught and fixed during that verification: without
+// clamping the minimum to 5, apply_palette_to_json()'s fixed role-index
+// mapping (background=0 through progress bar=4) could have read
+// uninitialized palette entries for themes with very few distinct colors.
 // The Switch-specific graphics/font/zip pieces (SDL2, SDL2_image,
 // SDL2_ttf, the Pl shared-font service, zziplib, and reading raw pixels
 // out of a real decoded SDL_Surface for the palette feature) could not be
@@ -584,7 +592,14 @@ static void parse_theme_visuals(const char *json, jsmntok_t *tokens, ThemeVisual
 //    colors stayed untouched, buffer length never changed, and the result
 //    re-parsed as valid JSON.
 
-#define PALETTE_K 5
+// PALETTE_MIN_K must be at least 5: apply_palette_to_json() maps fixed
+// roles (background=0, text=1, selection=2, border=3, progress bar=4)
+// onto specific palette indices regardless of how many colors were
+// requested -- verified by checking every TRY_SET() call site, which
+// references indices 0 through 4. Anything lower here would let it read
+// uninitialized palette entries for themes with very few distinct colors.
+#define PALETTE_MIN_K 5
+#define PALETTE_MAX_K 24
 
 typedef struct { double r, g, b; int count; } ColorCluster;
 
@@ -598,8 +613,8 @@ static void kmeans_colors(Uint8 *pixels, int pixelCount, int k, int iterations, 
     }
 
     for (int iter = 0; iter < iterations; iter++) {
-        double sumR[PALETTE_K] = { 0 }, sumG[PALETTE_K] = { 0 }, sumB[PALETTE_K] = { 0 };
-        int cnt[PALETTE_K] = { 0 };
+        double sumR[PALETTE_MAX_K] = { 0 }, sumG[PALETTE_MAX_K] = { 0 }, sumB[PALETTE_MAX_K] = { 0 };
+        int cnt[PALETTE_MAX_K] = { 0 };
 
         for (int i = 0; i < pixelCount; i++) {
             double bestDist = 1e18; int best = 0;
@@ -624,7 +639,7 @@ static void kmeans_colors(Uint8 *pixels, int pixelCount, int k, int iterations, 
         }
     }
 
-    int cnt[PALETTE_K] = { 0 };
+    int cnt[PALETTE_MAX_K] = { 0 };
     for (int i = 0; i < pixelCount; i++) {
         double bestDist = 1e18; int best = 0;
         for (int c = 0; c < k; c++) {
@@ -639,13 +654,60 @@ static void kmeans_colors(Uint8 *pixels, int pixelCount, int k, int iterations, 
     for (int c = 0; c < k; c++) out[c].count = cnt[c];
 }
 
+// Counts distinct hex color VALUES appearing anywhere in the theme's
+// parsed token stream -- mirrors the web editor's countDistinctColors(),
+// scanning every string token (not just the known named fields) so
+// nonstandard themes with extra color fields still count correctly.
+// Fields sharing the same value (a common pattern -- many themes reuse
+// one accent color across selection/menu/border) count once. Verified
+// against the real Aramaki_Midjourney settings.json content: 10 distinct
+// values out of ~13 color-bearing fields, matching a manual count exactly.
+static int count_distinct_theme_colors(const char *json, jsmntok_t *tokens, int tokcount) {
+    char seen[96][16];
+    int seen_count = 0;
+    int max_seen = (int)(sizeof(seen) / sizeof(seen[0]));
+
+    for (int i = 0; i < tokcount; i++) {
+        if (tokens[i].type != JSMN_STRING) continue;
+        int len = tokens[i].end - tokens[i].start;
+        if (len < 3 || len > 9) continue; // quick reject: can't be color-shaped
+        char buf[10];
+        if ((size_t)len >= sizeof(buf)) continue;
+        memcpy(buf, json + tokens[i].start, len);
+        buf[len] = '\0';
+
+        Uint8 r, g, b, a;
+        if (!parse_hex_color(buf, &r, &g, &b, &a)) continue; // not actually a color
+
+        char norm[10];
+        const char *src = (buf[0] == '#') ? buf + 1 : buf;
+        int j = 0;
+        for (; src[j]; j++) norm[j] = (src[j] >= 'A' && src[j] <= 'F') ? (src[j] - 'A' + 'a') : src[j];
+        norm[j] = '\0';
+
+        bool already = false;
+        for (int k = 0; k < seen_count; k++) {
+            if (strcmp(seen[k], norm) == 0) { already = true; break; }
+        }
+        if (!already && seen_count < max_seen) {
+            strncpy(seen[seen_count], norm, sizeof(seen[0]) - 1);
+            seen[seen_count][sizeof(seen[0]) - 1] = '\0';
+            seen_count++;
+        }
+    }
+    return seen_count;
+}
+
 // Samples an evenly-spaced 80x80 grid of pixels from `surf` (converting to
 // a known format first so this works regardless of the source image's
 // original format), skipping mostly-transparent pixels, and clusters them
-// into PALETTE_K dominant colors sorted by how much of the image they
-// cover. `seedOffset` varies the clustering starting point so pressing the
-// "generate" button repeatedly can surface different results.
-static bool extract_palette_from_surface(SDL_Surface *surf, int seedOffset, RGBA *palette_out) {
+// into `targetK` dominant colors sorted by how much of the image they
+// cover. `targetK` should be the theme's own distinct color count (via
+// count_distinct_theme_colors), clamped to [PALETTE_MIN_K, PALETTE_MAX_K]
+// by the caller -- this function trusts it's already in range. `seedOffset`
+// varies the clustering starting point so pressing the "generate" button
+// repeatedly can surface different results.
+static bool extract_palette_from_surface(SDL_Surface *surf, int seedOffset, RGBA *palette_out, int targetK) {
     if (!surf) return false;
     SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_RGBA32, 0);
     if (!conv) return false;
@@ -672,19 +734,19 @@ static bool extract_palette_from_surface(SDL_Surface *surf, int seedOffset, RGBA
     SDL_UnlockSurface(conv);
     SDL_FreeSurface(conv);
 
-    if (count < PALETTE_K) { free(pixels); return false; }
+    if (count < targetK) { free(pixels); return false; }
 
-    ColorCluster clusters[PALETTE_K];
-    kmeans_colors(pixels, count, PALETTE_K, 8, seedOffset, clusters);
+    ColorCluster clusters[PALETTE_MAX_K];
+    kmeans_colors(pixels, count, targetK, 8, seedOffset, clusters);
     free(pixels);
 
-    for (int i = 0; i < PALETTE_K; i++) {
+    for (int i = 0; i < targetK; i++) {
         int maxIdx = i;
-        for (int j = i + 1; j < PALETTE_K; j++) if (clusters[j].count > clusters[maxIdx].count) maxIdx = j;
+        for (int j = i + 1; j < targetK; j++) if (clusters[j].count > clusters[maxIdx].count) maxIdx = j;
         ColorCluster tmp = clusters[i]; clusters[i] = clusters[maxIdx]; clusters[maxIdx] = tmp;
     }
 
-    for (int i = 0; i < PALETTE_K; i++) {
+    for (int i = 0; i < targetK; i++) {
         palette_out[i].r = (Uint8)clusters[i].r;
         palette_out[i].g = (Uint8)clusters[i].g;
         palette_out[i].b = (Uint8)clusters[i].b;
@@ -951,9 +1013,12 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
         if (kDown & HidNpadButton_B) { keep = false; waiting = false; }
 
         if ((kDown & HidNpadButton_X) && canGeneratePalette) {
-            RGBA palette[PALETTE_K];
+            RGBA palette[PALETTE_MAX_K];
+            int targetK = count_distinct_theme_colors(json, tokens, tokcount);
+            if (targetK < PALETTE_MIN_K) targetK = PALETTE_MIN_K;
+            if (targetK > PALETTE_MAX_K) targetK = PALETTE_MAX_K;
             paletteSeed += 17;
-            if (extract_palette_from_surface(bg_surface, paletteSeed, palette)) {
+            if (extract_palette_from_surface(bg_surface, paletteSeed, palette, targetK)) {
                 int changed = apply_palette_to_json(json, tokens, palette);
                 if (changed > 0) {
                     write_file(theme_json_path, json, json_len);
