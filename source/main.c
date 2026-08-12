@@ -30,8 +30,9 @@
 // ALL of the JSON-parsing and color-parsing logic in this file (manifest
 // parsing, nested theme.json field lookups for background/selection/
 // border/progressBar/logo, hex color decoding, k-means palette
-// clustering, in-place JSON color editing, and the palette size now
-// dynamically matching each theme's own distinct color count) was
+// clustering, in-place JSON color editing, the palette size now
+// dynamically matching each theme's own distinct color count, and
+// setting the active theme in Tinfoil's own options.json) was
 // compiled and run for real on a PC against actual A-Theme content and
 // synthetic test data before being written here — see parse_manifest(),
 // parse_theme_visuals(), parse_hex_color(), kmeans_colors(),
@@ -42,6 +43,13 @@
 // clamping the minimum to 5, apply_palette_to_json()'s fixed role-index
 // mapping (background=0 through progress bar=4) could have read
 // uninitialized palette entries for themes with very few distinct colors.
+// The active-theme feature was likewise verified against a REAL
+// options.json pulled off an actual SD card: confirmed the result
+// re-parses as valid JSON, exactly one field changes, zero keys are
+// lost, every byte before and after the theme value is bit-identical,
+// and every credential field (linkedUserSig, fingerprint, googleApiKey,
+// saved username/password) survives untouched -- plus safe refusal on
+// malformed JSON and on a file with no "theme" key.
 // The Switch-specific graphics/font/zip pieces (SDL2, SDL2_image,
 // SDL2_ttf, the Pl shared-font service, zziplib, and reading raw pixels
 // out of a real decoded SDL_Surface for the palette feature) could not be
@@ -71,6 +79,12 @@
 #define MANIFEST_URL "https://raw.githubusercontent.com/A-Theme/Tinfoil-Themes/main/themes.json"
 #define THEMES_ROOT "sdmc:/switch/tinfoil/themes/"
 #define APP_DATA_DIR "sdmc:/switch/a-theme-installer/"
+// Tinfoil's own settings file. Contains real credentials (linkedUserSig,
+// fingerprint, API keys, saved passwords) alongside the "theme" field --
+// see set_theme_in_options() for why it is edited surgically and never
+// regenerated.
+#define TINFOIL_OPTIONS_PATH "sdmc:/switch/tinfoil/options.json"
+#define TINFOIL_OPTIONS_BACKUP APP_DATA_DIR "options.json.bak"
 #define TEMP_ZIP_PATH APP_DATA_DIR "_download.zip"
 
 #define SCREEN_W 1280
@@ -479,6 +493,118 @@ static bool extract_zip(const char *zip_path, const char *dest_dir, bool *found_
 
     zzip_dir_close(dir);
     return extracted_any;
+}
+
+// ---- Setting the active theme in Tinfoil's own settings ----------------------
+//
+// Tinfoil records which theme is active as a plain "theme" string in
+// sdmc:/switch/tinfoil/options.json, holding the folder name from
+// themes/ -- exactly what derive_names() already produces. So installing
+// a theme AND making it active is possible without Tinfoil's UI.
+//
+// The catch, and why this is prompt-only rather than automatic: that
+// same file holds real credentials -- linkedUserSig, fingerprint,
+// googleApiKey, saved username/password. It must NEVER be regenerated or
+// re-serialized; doing so risks mangling or dropping fields this app
+// doesn't understand. Instead the theme value's bytes are spliced and
+// every other byte is copied through untouched, and a backup is written
+// first.
+//
+// Verified for real before being written here: compiled and run against
+// an actual options.json pulled off a real SD card. Confirmed the result
+// re-parses as valid JSON, exactly one field changes, zero keys are
+// lost, every byte before and after the theme value is bit-identical,
+// and every credential field survives unchanged. Also tested refusing
+// safely on malformed JSON and on a file with no "theme" key, and
+// handling a replacement name shorter than the original.
+
+// Returns a malloc'd modified copy (caller frees) or NULL on any failure.
+// On NULL the caller MUST leave the original file untouched.
+static char *set_theme_in_options(const char *json, size_t json_len,
+                                   const char *themeName, size_t *out_len) {
+    jsmn_parser p;
+    jsmn_init(&p);
+    int tokcount = jsmn_parse(&p, json, json_len, NULL, 0);
+    if (tokcount < 1) return NULL;
+
+    jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * tokcount);
+    if (!tokens) return NULL;
+    jsmn_init(&p);
+    if (jsmn_parse(&p, json, json_len, tokens, tokcount) < 1) { free(tokens); return NULL; }
+    if (tokens[0].type != JSMN_OBJECT) { free(tokens); return NULL; }
+
+    // Only walk DIRECT children of the root object, so a nested "theme"
+    // key elsewhere in the file can't be hit by mistake.
+    int theme_val_idx = -1;
+    int i = 1;
+    for (int n = 0; n < tokens[0].size; n++) {
+        int key_idx = i;
+        int val_idx = key_idx + 1;
+        if (val_idx >= tokcount) break;
+        int klen = tokens[key_idx].end - tokens[key_idx].start;
+        if (klen == 5 && strncmp(json + tokens[key_idx].start, "theme", 5) == 0) {
+            theme_val_idx = val_idx;
+            break;
+        }
+        i = skip_token_subtree(tokens, val_idx);
+    }
+    if (theme_val_idx < 0 || theme_val_idx >= tokcount) { free(tokens); return NULL; }
+    if (tokens[theme_val_idx].type != JSMN_STRING) { free(tokens); return NULL; }
+
+    int vstart = tokens[theme_val_idx].start;
+    int vend   = tokens[theme_val_idx].end;
+    free(tokens);
+
+    size_t namelen = strlen(themeName);
+    size_t newlen = json_len - (size_t)(vend - vstart) + namelen;
+    char *out = malloc(newlen + 1);
+    if (!out) return NULL;
+
+    memcpy(out, json, (size_t)vstart);
+    memcpy(out + vstart, themeName, namelen);
+    memcpy(out + vstart + namelen, json + vend, json_len - (size_t)vend);
+    out[newlen] = '\0';
+
+    *out_len = newlen;
+    return out;
+}
+
+// Reads Tinfoil's options.json, sets the active theme, writes a backup,
+// then writes the modified file. Returns true on success; on any failure
+// the original file is left exactly as it was.
+static bool set_active_theme(const char *themeFolder, char *err, size_t errcap) {
+    char *json = NULL;
+    size_t json_len = 0;
+    if (!read_file(TINFOIL_OPTIONS_PATH, &json, &json_len)) {
+        snprintf(err, errcap, "Could not read Tinfoil's options.json");
+        return false;
+    }
+
+    size_t newlen = 0;
+    char *modified = set_theme_in_options(json, json_len, themeFolder, &newlen);
+    if (!modified) {
+        free(json);
+        snprintf(err, errcap, "options.json wasn't in the expected format -- left untouched");
+        return false;
+    }
+
+    // Back up the original before overwriting anything.
+    mkpath(APP_DATA_DIR);
+    if (!write_file(TINFOIL_OPTIONS_BACKUP, json, json_len)) {
+        free(json);
+        free(modified);
+        snprintf(err, errcap, "Could not write a backup -- not touching options.json");
+        return false;
+    }
+    free(json);
+
+    if (!write_file(TINFOIL_OPTIONS_PATH, modified, newlen)) {
+        free(modified);
+        snprintf(err, errcap, "Could not write options.json (backup is at %s)", TINFOIL_OPTIONS_BACKUP);
+        return false;
+    }
+    free(modified);
+    return true;
 }
 
 // ---- Install logic -----------------------------------------------------------
@@ -1113,6 +1239,45 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
 
 // ---- Menu screen --------------------------------------------------------------
 
+// A simple yes/no prompt drawn over the current screen. Returns true for
+// A (yes), false for B (no). Used to ask before touching Tinfoil's
+// options.json, since that file holds credentials and shouldn't be
+// modified without the user explicitly saying so.
+static bool confirm_prompt(const char *line1, const char *line2, const char *line3) {
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&pad);
+
+    SDL_Color white  = { 234, 241, 250, 255 };
+    SDL_Color dim    = { 150, 168, 190, 255 };
+    SDL_Color accent = { 60, 200, 255, 255 };
+
+    bool result = false;
+    bool waiting = true;
+    while (appletMainLoop() && waiting) {
+        padUpdate(&pad);
+        u64 kDown = padGetButtonsDown(&pad);
+        if (kDown & HidNpadButton_A) { result = true; waiting = false; }
+        if (kDown & HidNpadButton_B) { result = false; waiting = false; }
+
+        SDL_SetRenderDrawColor(g_renderer, 11, 20, 32, 255);
+        SDL_RenderClear(g_renderer);
+
+        int boxW = 820, boxH = 260;
+        int boxX = (SCREEN_W - boxW) / 2, boxY = (SCREEN_H - boxH) / 2;
+        fill_rect(boxX, boxY, boxW, boxH, (RGBA){ 18, 30, 46, 255 });
+        draw_rect_outline(boxX, boxY, boxW, boxH, (RGBA){ 60, 200, 255, 180 }, 2);
+
+        draw_text(boxX + 34, boxY + 38, line1, white);
+        if (line2 && line2[0]) draw_text_small(boxX + 34, boxY + 92, line2, dim);
+        if (line3 && line3[0]) draw_text_small(boxX + 34, boxY + 122, line3, dim);
+        draw_text_small(boxX + 34, boxY + boxH - 48, "A = Yes        B = No", accent);
+
+        SDL_RenderPresent(g_renderer);
+    }
+    return result;
+}
+
 static void draw_menu(Theme *themes, int count, int cursor, int scroll, const char *status) {
     SDL_SetRenderDrawColor(g_renderer, 11, 20, 32, 255);
     SDL_RenderClear(g_renderer);
@@ -1292,20 +1457,43 @@ int main(int argc, char **argv) {
 
                 if (!ok) {
                     snprintf(statusMsg, sizeof(statusMsg), "Failed: %s -- \"%s\"", detail, t->name);
-                } else if (!wantsPreview) {
-                    snprintf(statusMsg, sizeof(statusMsg),
-                        "Installed \"%s\" -- pick it in Tinfoil's theme settings.", t->name);
                 } else {
-                    char dest_dir[300];
-                    snprintf(dest_dir, sizeof(dest_dir), THEMES_ROOT "%s", t->folder);
+                    bool keep = true;
+                    if (wantsPreview) {
+                        char dest_dir[300];
+                        snprintf(dest_dir, sizeof(dest_dir), THEMES_ROOT "%s", t->folder);
+                        keep = show_theme_preview_and_confirm(dest_dir, t->name);
+                        if (!keep) {
+                            remove_dir_recursive(dest_dir);
+                            snprintf(statusMsg, sizeof(statusMsg), "Removed \"%s\".", t->name);
+                        }
+                    }
 
-                    bool keep = show_theme_preview_and_confirm(dest_dir, t->name);
                     if (keep) {
-                        snprintf(statusMsg, sizeof(statusMsg),
-                            "Installed \"%s\" -- pick it in Tinfoil's theme settings.", t->name);
-                    } else {
-                        remove_dir_recursive(dest_dir);
-                        snprintf(statusMsg, sizeof(statusMsg), "Removed \"%s\".", t->name);
+                        // Offer to make it the active theme. This edits
+                        // Tinfoil's own options.json, which also holds
+                        // credentials -- so it's always asked, never
+                        // assumed, and a backup is written first.
+                        char prompt_line[220];
+                        snprintf(prompt_line, sizeof(prompt_line), "Make \"%s\" your active theme?", t->name);
+                        bool setActive = confirm_prompt(
+                            prompt_line,
+                            "This updates Tinfoil's own settings so it loads next time you open it.",
+                            "Close Tinfoil first, or it may overwrite this when it exits.");
+
+                        if (setActive) {
+                            char err[160] = "";
+                            if (set_active_theme(t->folder, err, sizeof(err))) {
+                                snprintf(statusMsg, sizeof(statusMsg),
+                                    "Installed \"%s\" and set it active -- restart Tinfoil to see it.", t->name);
+                            } else {
+                                snprintf(statusMsg, sizeof(statusMsg),
+                                    "Installed \"%s\", but couldn't set it active: %s", t->name, err);
+                            }
+                        } else {
+                            snprintf(statusMsg, sizeof(statusMsg),
+                                "Installed \"%s\" -- pick it in Tinfoil's theme settings.", t->name);
+                        }
                     }
                 }
                 statusTimer = 240;

@@ -79,8 +79,16 @@ confirmed on real hardware.
 <tr><td><b>A</b> / <b>B</b><br><i>(on preview)</i></td><td>Keep whatever's currently applied, or discard the whole install</td></tr>
 </table>
 
-Installed themes land in `sdmc:/switch/tinfoil/themes/<name>/`, ready to
-pick in Tinfoil's own theme settings.
+Installed themes land in `sdmc:/switch/tinfoil/themes/<name>/`, and after
+each successful install the app **asks whether to make it your active
+theme** — say yes and it updates Tinfoil's own settings so the theme is
+already applied next time you open Tinfoil, no menu-diving required.
+
+> Because Tinfoil's `options.json` also holds credentials, this is always
+> a prompt, never automatic, and a backup is written to
+> `sdmc:/switch/a-theme-installer/options.json.bak` before anything is
+> changed. Close Tinfoil before setting an active theme — if it's running,
+> it may overwrite the change when it exits.
 
 ---
 
