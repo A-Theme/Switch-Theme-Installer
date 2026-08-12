@@ -114,7 +114,11 @@ else
 endif
 ifeq ($(strip $(APP_ICON)),)
 else
-	NROFLAGS += --icon=$(APP_ICON)
+	# Anchored to $(TOPDIR), not left relative: the build re-invokes make
+	# from inside build/, so a bare "icon.jpg" would be looked up in
+	# build/icon.jpg and fail with "Failed to open input icon!". Same
+	# reason --romfsdir above uses an absolute path.
+	NROFLAGS += --icon=$(TOPDIR)/$(APP_ICON)
 endif
 
 .PHONY: $(BUILD) clean all
