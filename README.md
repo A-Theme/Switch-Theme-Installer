@@ -43,7 +43,7 @@ each round fixed something real:
 1. First build — compiled clean on a real Windows devkitPro install.
 2. Real install failed — the app looked for `theme.json` inside the zip,
    but A-Theme's zips package it as `settings.json`. Fixed: either name is
-   now recognized and normalized to `theme.json` on the SD card.
+   now recognized inside a zip.
 3. Preview only showed a raw background image and **crashed** leaving the
    screen. Root cause: toggling between libnx's text console and SDL2 for
    just the preview. Fixed at the root — SDL2 now owns the display for the
@@ -55,6 +55,11 @@ each round fixed something real:
    uninitialized-memory risk in the role-mapping logic before it ever
    reached hardware. See the [release notes](../../releases) for the full
    writeup.
+5. Themes installed correctly but **Tinfoil still showed the default
+   theme** — entry 2 above had the naming backwards. A real SD card
+   settled it: 11 of 12 working theme folders use `settings.json`, and
+   the one `theme.json` folder was created by this installer (and didn't
+   load). Tinfoil reads `settings.json`, so that's what gets written now.
 
 All the JSON/color-parsing logic (manifest parsing, nested theme.json
 field lookups, hex color decoding) and the palette-generation logic

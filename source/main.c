@@ -473,13 +473,15 @@ static bool extract_zip(const char *zip_path, const char *dest_dir, bool *found_
         zzip_file_close(zf);
 
         if (read_ok) {
-            // A-Theme's zips package the config file as "settings.json"
-            // (confirmed against real theme files), but Tinfoil reads
-            // "theme.json" from the SD card. Normalize whichever name we
-            // find to what Tinfoil actually expects.
+            // Tinfoil reads "settings.json" from each theme folder --
+            // confirmed against a real SD card, where 11 of 12 working
+            // themes use that name (the lone theme.json folder was one
+            // this installer created, and it did NOT load in Tinfoil).
+            // Zips in the wild use either name, so accept both on read
+            // and always normalize to settings.json on write.
             bool is_config = (strcasecmp(base, "theme.json") == 0 ||
                                strcasecmp(base, "settings.json") == 0);
-            const char *dest_name = is_config ? "theme.json" : base;
+            const char *dest_name = is_config ? "settings.json" : base;
 
             char dest_path[600];
             snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, dest_name);
@@ -639,7 +641,7 @@ static bool install_theme(const Theme *t, char *status_detail, size_t status_cap
         return false;
     }
     if (!found_theme_json) {
-        snprintf(status_detail, status_cap, "Installed, but no theme.json/settings.json found inside the zip");
+        snprintf(status_detail, status_cap, "Installed, but no settings.json/theme.json found inside the zip");
         return false;
     }
 
@@ -1074,11 +1076,19 @@ static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
 // Returns true if the user pressed A (keep), false for B (undo).
 static bool show_theme_preview_and_confirm(const char *dest_dir, const char *theme_name) {
     char theme_json_path[350];
-    snprintf(theme_json_path, sizeof(theme_json_path), "%s/theme.json", dest_dir);
+    snprintf(theme_json_path, sizeof(theme_json_path), "%s/settings.json", dest_dir);
 
     char *json = NULL;
     size_t json_len = 0;
     bool have_json = read_file(theme_json_path, &json, &json_len);
+    if (!have_json) {
+        // Fall back to theme.json -- covers folders left behind by an
+        // earlier build of this installer, which wrote that name before
+        // real-hardware testing showed Tinfoil actually reads
+        // settings.json.
+        snprintf(theme_json_path, sizeof(theme_json_path), "%s/theme.json", dest_dir);
+        have_json = read_file(theme_json_path, &json, &json_len);
+    }
 
     jsmntok_t tokens[512];
     int tokcount = 0;
