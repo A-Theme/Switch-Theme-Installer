@@ -20,8 +20,10 @@ include $(DEVKITPRO)/libnx/switch_rules
 APP_TITLE   := A-Theme Installer
 APP_AUTHOR  := A-Theme
 APP_VERSION := 1.0.0
-# ICON left unset on purpose — hbmenu will use its default icon.
-# Set APP_ICON := icon.jpg (256x256) here if you want a custom one.
+# Switch homebrew icons must be 256x256 JPEG -- icon.jpg in this folder
+# is exactly that (the A-Theme logo, flattened onto its own dark
+# background since JPEG has no alpha channel).
+APP_ICON    := icon.jpg
 
 #---------------------------------------------------------------------------------
 # Build config
