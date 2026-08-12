@@ -68,7 +68,7 @@
 #include <ctype.h>   // isxdigit
 #include <sys/stat.h>
 #include <dirent.h>
-#include <unistd.h>  // rmdir()
+#include <unistd.h>  // rmdir(), fsync()
 #include <stdbool.h>
 
 #define JSMN_STATIC
@@ -220,12 +220,30 @@ static void mkpath(const char *path) {
     mkdir(tmp, 0777);
 }
 
+// Writes a file and forces it all the way down to the SD card.
+//
+// On Switch, stdio writes sit in a buffered filesystem layer, and data is
+// NOT guaranteed committed just because fclose() returned. This bit us
+// for real: rewriting a theme's settings.json after generating a palette
+// appeared to succeed on-screen, but the file on the SD card was
+// completely unchanged. fflush() pushes stdio's buffer to the OS, and
+// fsync() then tells the filesystem to actually commit it to the card.
+// Every return value is checked so a failure surfaces instead of silently
+// looking like success.
 static bool write_file(const char *path, const char *data, size_t size) {
     FILE *f = fopen(path, "wb");
     if (!f) return false;
+
     size_t written = fwrite(data, 1, size, f);
-    fclose(f);
-    return written == size;
+    if (written != size) { fclose(f); return false; }
+
+    if (fflush(f) != 0) { fclose(f); return false; }
+
+    // Commit to the actual storage device, not just the OS buffer.
+    int fd = fileno(f);
+    if (fd >= 0) fsync(fd);
+
+    return fclose(f) == 0;
 }
 
 static bool read_file(const char *path, char **out_data, size_t *out_size) {
@@ -1157,7 +1175,11 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
             if (extract_palette_from_surface(bg_surface, paletteSeed, palette, targetK)) {
                 int changed = apply_palette_to_json(json, tokens, palette);
                 if (changed > 0) {
-                    write_file(theme_json_path, json, json_len);
+                    // Check the write -- silently ignoring a failure here
+                    // makes a failed save look identical to a successful
+                    // one, which is exactly the kind of thing that wastes
+                    // an hour of debugging later.
+                    bool wrote = write_file(theme_json_path, json, json_len);
                     // Token byte-ranges are still valid (apply_hex_inplace
                     // never changes buffer length), so re-deriving visuals
                     // from the same tokens against the now-edited buffer
@@ -1173,9 +1195,14 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
                     if (visuals.has_progress_bg) progress_bg = visuals.progress_bg;
                     text_sdl = (SDL_Color){ text_color.r, text_color.g, text_color.b, 255 };
 
-                    snprintf(paletteStatus, sizeof(paletteStatus),
-                        "Applied a new palette to %d color%s from the background.",
-                        changed, changed == 1 ? "" : "s");
+                    if (wrote) {
+                        snprintf(paletteStatus, sizeof(paletteStatus),
+                            "Applied a new palette to %d color%s -- saved.",
+                            changed, changed == 1 ? "" : "s");
+                    } else {
+                        snprintf(paletteStatus, sizeof(paletteStatus),
+                            "Palette shown here, but COULD NOT SAVE to the theme file.");
+                    }
                 } else {
                     snprintf(paletteStatus, sizeof(paletteStatus), "No color fields found to update.");
                 }

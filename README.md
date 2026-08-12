@@ -60,6 +60,15 @@ each round fixed something real:
    settled it: 11 of 12 working theme folders use `settings.json`, and
    the one `theme.json` folder was created by this installer (and didn't
    load). Tinfoil reads `settings.json`, so that's what gets written now.
+6. Generating a palette on the preview screen **appeared to work but
+   never actually saved** — the file on the SD card was untouched. The
+   apply-and-write logic was proven correct against a real
+   `settings.json`, which narrowed it to the write not committing:
+   Switch stdio writes sit in a buffered filesystem layer and aren't
+   guaranteed on the card just because `fclose()` returned. Fixed with an
+   explicit `fflush()` + `fsync()`, and every return value along the way
+   is now checked so a failed save says so instead of looking identical
+   to a successful one.
 
 All the JSON/color-parsing logic (manifest parsing, nested theme.json
 field lookups, hex color decoding) and the palette-generation logic
