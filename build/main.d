@@ -1,4 +1,4 @@
-main.o: C:/Users/demia/Desktop/switch-theme-installer-repo/source/main.c \
+main.o: C:/users/demia/desktop/switch-theme-installer-repo/source/main.c \
  C:/devkitPro/portlibs/switch/include/curl/curl.h \
  C:/devkitPro/portlibs/switch/include/curl/curlver.h \
  C:/devkitPro/portlibs/switch/include/curl/system.h \
@@ -64,7 +64,7 @@ main.o: C:/Users/demia/Desktop/switch-theme-installer-repo/source/main.c \
  C:/devkitPro/portlibs/switch/include/SDL2/SDL_image.h \
  C:/devkitPro/portlibs/switch/include/SDL2/SDL.h \
  C:/devkitPro/portlibs/switch/include/SDL2/SDL_ttf.h \
- C:/Users/demia/Desktop/switch-theme-installer-repo/include/jsmn.h
+ C:/users/demia/desktop/switch-theme-installer-repo/include/jsmn.h
 C:/devkitPro/portlibs/switch/include/curl/curl.h:
 C:/devkitPro/portlibs/switch/include/curl/curlver.h:
 C:/devkitPro/portlibs/switch/include/curl/system.h:
@@ -130,4 +130,4 @@ C:/devkitPro/portlibs/switch/include/SDL2/SDL_misc.h:
 C:/devkitPro/portlibs/switch/include/SDL2/SDL_image.h:
 C:/devkitPro/portlibs/switch/include/SDL2/SDL.h:
 C:/devkitPro/portlibs/switch/include/SDL2/SDL_ttf.h:
-C:/Users/demia/Desktop/switch-theme-installer-repo/include/jsmn.h:
+C:/users/demia/desktop/switch-theme-installer-repo/include/jsmn.h:

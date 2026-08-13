@@ -40,10 +40,17 @@ pacman -S switch-dev switch-curl switch-mbedtls switch-zlib switch-zziplib switc
 
 ## 3. Add the CA certificate bundle
 
+The `romfs/` folder already contains `logo.png` and `logo_large.png`
+(shipped with this repo — they get baked into the `.nro`, so there's
+nothing to place on the SD card). You just need to add the certificate
+bundle, which isn't redistributed here:
+
 ```bash
-mkdir -p romfs
 curl -o romfs/cacert.pem https://curl.se/ca/cacert.pem
 ```
+
+If the logos are ever missing, the app still builds and runs fine — it
+just falls back to a text-only header.
 
 ## 4. Build
 

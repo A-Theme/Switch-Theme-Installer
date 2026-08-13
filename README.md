@@ -69,6 +69,15 @@ each round fixed something real:
    explicit `fflush()` + `fsync()`, and every return value along the way
    is now checked so a failed save says so instead of looking identical
    to a successful one.
+7. Palette edits *still* seemed not to stick — but this time the saves
+   were working perfectly and the **next install was wiping them**.
+   Pressing A or Y always re-downloaded and re-extracted the zip, and the
+   zip's original `settings.json` overwrote the edited one. Found by
+   having the app write an independent proof file alongside its save: the
+   proof file was on the SD card with the new colors recorded, while
+   `settings.json` had reverted — which only makes sense if something
+   re-extracted afterwards. The installer now detects an existing install
+   and asks before replacing it.
 
 All the JSON/color-parsing logic (manifest parsing, nested theme.json
 field lookups, hex color decoding) and the palette-generation logic

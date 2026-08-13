@@ -116,6 +116,10 @@ static SDL_Window *g_window = NULL;
 static SDL_Renderer *g_renderer = NULL;
 static TTF_Font *g_font = NULL;
 static TTF_Font *g_font_small = NULL;
+// Logos embedded in the NRO via romfs -- no external files to ship.
+static SDL_Texture *g_logo = NULL;
+static SDL_Texture *g_logo_large = NULL;
+static int g_logo_w = 0, g_logo_h = 0;
 
 // ---- Networking helpers ---------------------------------------------------
 
@@ -243,7 +247,16 @@ static bool write_file(const char *path, const char *data, size_t size) {
     int fd = fileno(f);
     if (fd >= 0) fsync(fd);
 
-    return fclose(f) == 0;
+    if (fclose(f) != 0) return false;
+
+    // fsync() on the file descriptor is NOT sufficient on Switch: writes
+    // go through libnx's fsdev layer, which keeps its own device-level
+    // cache. Without this commit the data can sit there indefinitely and
+    // never reach the SD card -- which is exactly what happened here,
+    // with write_file() reporting success while the file on the card
+    // stayed unchanged.
+    fsdevCommitDevice("sdmc");
+    return true;
 }
 
 static bool read_file(const char *path, char **out_data, size_t *out_size) {
@@ -1017,6 +1030,44 @@ static void draw_rect_outline(int x, int y, int w, int h, RGBA c, int thickness)
     }
 }
 
+// ---- A-Theme brand palette (matches the web editor and the READMEs) ----
+#define BRAND_RED    ((RGBA){ 255,  60,  80, 255 })
+#define BRAND_PURPLE ((RGBA){ 157,  78, 221, 255 })
+#define BRAND_BLUE   ((RGBA){   0, 194, 255, 255 })
+#define BG_DEEP      ((RGBA){  11,  20,  32, 255 })
+#define BG_PANEL     ((RGBA){  17,  29,  44, 255 })
+
+static RGBA lerp_rgba(RGBA a, RGBA b, float t) {
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    RGBA o;
+    o.r = (Uint8)(a.r + (b.r - a.r) * t);
+    o.g = (Uint8)(a.g + (b.g - a.g) * t);
+    o.b = (Uint8)(a.b + (b.b - a.b) * t);
+    o.a = (Uint8)(a.a + (b.a - a.a) * t);
+    return o;
+}
+
+// Horizontal three-stop gradient bar: red -> purple -> blue, the same
+// sweep used on the project's banners and READMEs.
+static void draw_brand_gradient(int x, int y, int w, int h) {
+    for (int i = 0; i < w; i++) {
+        float t = (float)i / (w > 1 ? (w - 1) : 1);
+        RGBA c = (t < 0.5f)
+            ? lerp_rgba(BRAND_RED, BRAND_PURPLE, t / 0.5f)
+            : lerp_rgba(BRAND_PURPLE, BRAND_BLUE, (t - 0.5f) / 0.5f);
+        fill_rect(x + i, y, 1, h, c);
+    }
+}
+
+// Vertical fade, used to give panels some depth instead of flat fills.
+static void draw_vgradient(int x, int y, int w, int h, RGBA top, RGBA bottom) {
+    for (int i = 0; i < h; i++) {
+        float t = (float)i / (h > 1 ? (h - 1) : 1);
+        fill_rect(x, y + i, w, 1, lerp_rgba(top, bottom, t));
+    }
+}
+
 static void draw_text_ex(TTF_Font *font, int x, int y, const char *text, SDL_Color color) {
     if (!font || !text || !text[0]) return;
     SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, color);
@@ -1081,6 +1132,10 @@ static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
     return load_theme_image_ex(dest_dir, ref, NULL);
 }
 
+// Defined further down with the other prompt screens; declared here
+// because the preview needs it too.
+static void wait_for_button_release(void);
+
 // ---- Preview screen -----------------------------------------------------------
 // Builds a rough mockup of the real Tinfoil layout — icon grid, a
 // "selected" tile using the theme's actual selection colors, a border
@@ -1092,7 +1147,13 @@ static SDL_Texture *load_theme_image(const char *dest_dir, const char *ref) {
 // (X) and apply it directly to the theme's colors, right here.
 //
 // Returns true if the user pressed A (keep), false for B (undo).
-static bool show_theme_preview_and_confirm(const char *dest_dir, const char *theme_name) {
+// `allowDelete` controls what B means. On a FRESH install, B is an undo:
+// it removes the theme that was just downloaded. But when previewing a
+// theme that was already on the SD card (the user declined to
+// re-download), there is nothing to undo -- B there just means "go back",
+// and deleting would destroy work the user explicitly chose to keep.
+// That distinction cost a user their edited theme, so it's explicit now.
+static bool show_theme_preview_and_confirm(const char *dest_dir, const char *theme_name, bool allowDelete) {
     char theme_json_path[350];
     snprintf(theme_json_path, sizeof(theme_json_path), "%s/settings.json", dest_dir);
 
@@ -1149,7 +1210,7 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
     SDL_Color hint_sdl = { 200, 210, 225, 255 };
     SDL_Color status_sdl = { 130, 225, 165, 255 };
 
-    char paletteStatus[80] = "";
+    char paletteStatus[300] = ""; // long enough for a full sdmc: path -- 80 truncated it mid-filename
     int paletteStatusTimer = 0;
     int paletteSeed = 0;
     bool canGeneratePalette = (bg_surface != NULL && tokcount > 0);
@@ -1164,7 +1225,10 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
         padUpdate(&pad);
         u64 kDown = padGetButtonsDown(&pad);
         if (kDown & HidNpadButton_A) { keep = true; waiting = false; }
-        if (kDown & HidNpadButton_B) { keep = false; waiting = false; }
+        // B only discards on a fresh install. For an already-installed
+        // theme there's nothing to undo, so B is simply "back" -- it must
+        // never delete a theme the user chose to keep.
+        if (kDown & HidNpadButton_B) { keep = allowDelete ? false : true; waiting = false; }
 
         if ((kDown & HidNpadButton_X) && canGeneratePalette) {
             RGBA palette[PALETTE_MAX_K];
@@ -1196,9 +1260,50 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
                     text_sdl = (SDL_Color){ text_color.r, text_color.g, text_color.b, 255 };
 
                     if (wrote) {
-                        snprintf(paletteStatus, sizeof(paletteStatus),
-                            "Applied a new palette to %d color%s -- saved.",
-                            changed, changed == 1 ? "" : "s");
+                        // Don't trust write_file's return value alone --
+                        // it already claimed success once while the file
+                        // on the SD card stayed unchanged. Read the file
+                        // back and compare against what we meant to
+                        // write.
+                        //
+                        // NOTE: a read-back can still be served from the
+                        // filesystem's own cache, so a match here does
+                        // NOT prove the data reached the card. That's why
+                        // the exact path is shown on screen and a
+                        // separate proof file is written alongside it --
+                        // between them we can tell "nothing was written"
+                        // from "written to the wrong place" from "written
+                        // correctly and reverted afterwards".
+                        char *check = NULL;
+                        size_t check_len = 0;
+                        bool verified = false;
+                        if (read_file(theme_json_path, &check, &check_len)) {
+                            verified = (check_len == json_len) &&
+                                       (memcmp(check, json, json_len) == 0);
+                            free(check);
+                        }
+
+                        // Independent proof file: if this shows up on the
+                        // SD card but settings.json is unchanged, the
+                        // problem is specific to that file, not to
+                        // writing in general.
+                        char proof_path[400];
+                        snprintf(proof_path, sizeof(proof_path), "%s/_athemeproof.txt", dest_dir);
+                        char proof[600];
+                        int plen = snprintf(proof, sizeof(proof),
+                            "wrote: %s\nbytes: %u\nfirst color now: %.8s\nchanged fields: %d\n",
+                            theme_json_path, (unsigned)json_len,
+                            json_len > 12 ? json + 12 : json, changed);
+                        write_file(proof_path, proof, (size_t)plen);
+
+                        if (verified) {
+                            snprintf(paletteStatus, sizeof(paletteStatus),
+                                "Saved %d color%s to %s", changed,
+                                changed == 1 ? "" : "s", theme_json_path);
+                        } else {
+                            snprintf(paletteStatus, sizeof(paletteStatus),
+                                "WROTE %s but read-back does NOT match.", theme_json_path);
+                        }
                     } else {
                         snprintf(paletteStatus, sizeof(paletteStatus),
                             "Palette shown here, but COULD NOT SAVE to the theme file.");
@@ -1258,9 +1363,13 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
             draw_text_small(40, 668, paletteStatus, status_sdl);
             paletteStatusTimer--;
         } else if (canGeneratePalette) {
-            draw_text_small(40, 668, "A = Keep    B = Remove    X = New palette from background", hint_sdl);
+            draw_text_small(40, 668, allowDelete
+                ? "A = Keep    B = Discard this download    X = New palette from background"
+                : "A = Done    B = Back    X = New palette from background", hint_sdl);
         } else {
-            draw_text_small(40, 668, "A = Keep this theme        B = Remove it", hint_sdl);
+            draw_text_small(40, 668, allowDelete
+                ? "A = Keep this theme        B = Discard this download"
+                : "A = Done        B = Back", hint_sdl);
         }
 
         SDL_RenderPresent(g_renderer);
@@ -1271,6 +1380,7 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
     if (logo_tex) SDL_DestroyTexture(logo_tex);
     if (json) free(json);
 
+    wait_for_button_release();
     return keep;
 }
 
@@ -1280,6 +1390,36 @@ static bool show_theme_preview_and_confirm(const char *dest_dir, const char *the
 // A (yes), false for B (no). Used to ask before touching Tinfoil's
 // options.json, since that file holds credentials and shouldn't be
 // modified without the user explicitly saying so.
+// Blocks until no face buttons are held, then drains one more frame.
+//
+// Without this, chained screens steal each other's input: confirm_prompt
+// returns the instant B goes down, the next screen's loop starts while B
+// is STILL physically held, and reads it as a fresh press. That caused
+// real data loss -- answering "No" to the reinstall prompt immediately
+// registered as "B = remove theme" on the preview screen and deleted the
+// very theme the user was trying to keep.
+static void wait_for_button_release(void) {
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&pad);
+    const u64 watched = HidNpadButton_A | HidNpadButton_B | HidNpadButton_X |
+                        HidNpadButton_Y | HidNpadButton_Plus;
+    int settled = 0;
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        if (padGetButtons(&pad) & watched) {
+            settled = 0;
+        } else if (++settled >= 2) { // two clean frames, guards against bounce
+            break;
+        }
+        // Deliberately does NOT present here: the back buffer holds
+        // whatever was drawn two frames ago on a double-buffered display,
+        // so presenting again would flicker between stale frames. The
+        // last presented frame simply stays on screen while we wait.
+        svcSleepThread(8000000ULL); // ~8ms, keeps this from spinning hot
+    }
+}
+
 static bool confirm_prompt(const char *line1, const char *line2, const char *line3) {
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -1297,62 +1437,172 @@ static bool confirm_prompt(const char *line1, const char *line2, const char *lin
         if (kDown & HidNpadButton_A) { result = true; waiting = false; }
         if (kDown & HidNpadButton_B) { result = false; waiting = false; }
 
-        SDL_SetRenderDrawColor(g_renderer, 11, 20, 32, 255);
-        SDL_RenderClear(g_renderer);
+        // Redraw a base each frame -- a semi-transparent overlay drawn
+        // repeatedly over its own previous output compounds and fades to
+        // black, so the backdrop has to be re-established every frame.
+        draw_vgradient(0, 0, SCREEN_W, SCREEN_H, (RGBA){ 14, 25, 39, 255 }, BG_DEEP);
+        draw_brand_gradient(0, 0, SCREEN_W, 4);
+        fill_rect(0, 0, SCREEN_W, SCREEN_H, (RGBA){ 6, 12, 20, 170 });
 
-        int boxW = 820, boxH = 260;
+        int boxW = 900, boxH = 280;
         int boxX = (SCREEN_W - boxW) / 2, boxY = (SCREEN_H - boxH) / 2;
-        fill_rect(boxX, boxY, boxW, boxH, (RGBA){ 18, 30, 46, 255 });
-        draw_rect_outline(boxX, boxY, boxW, boxH, (RGBA){ 60, 200, 255, 180 }, 2);
 
-        draw_text(boxX + 34, boxY + 38, line1, white);
-        if (line2 && line2[0]) draw_text_small(boxX + 34, boxY + 92, line2, dim);
-        if (line3 && line3[0]) draw_text_small(boxX + 34, boxY + 122, line3, dim);
-        draw_text_small(boxX + 34, boxY + boxH - 48, "A = Yes        B = No", accent);
+        draw_vgradient(boxX, boxY, boxW, boxH, (RGBA){ 24, 40, 60, 255 }, BG_PANEL);
+        draw_brand_gradient(boxX, boxY, boxW, 3);
+        draw_rect_outline(boxX, boxY, boxW, boxH, (RGBA){ 60, 200, 255, 140 }, 1);
+
+        draw_text(boxX + 38, boxY + 44, line1, white);
+        if (line2 && line2[0]) draw_text_small(boxX + 38, boxY + 104, line2, dim);
+        if (line3 && line3[0]) draw_text_small(boxX + 38, boxY + 134, line3, dim);
+
+        // button hints, visually separated from the message
+        fill_rect(boxX + 38, boxY + boxH - 68, boxW - 76, 1, (RGBA){ 50, 74, 100, 255 });
+        draw_text_small(boxX + 38, boxY + boxH - 48, "A = Yes", accent);
+        draw_text_small(boxX + 150, boxY + boxH - 48, "B = No", dim);
 
         SDL_RenderPresent(g_renderer);
     }
+    // Don't hand control to the next screen while the button is still
+    // physically down -- it would read it as a fresh press. See
+    // wait_for_button_release().
+    wait_for_button_release();
     return result;
 }
 
+// A branded loading screen shown while the manifest downloads. Takes a
+// frame counter so the progress bar animates rather than sitting frozen
+// during a slow network fetch.
+static void draw_splash(const char *message, int frame) {
+    draw_vgradient(0, 0, SCREEN_W, SCREEN_H, (RGBA){ 16, 28, 44, 255 }, BG_DEEP);
+    draw_brand_gradient(0, 0, SCREEN_W, 4);
+    draw_brand_gradient(0, SCREEN_H - 4, SCREEN_W, 4);
+
+    SDL_Color white = { 234, 241, 250, 255 };
+    SDL_Color dim   = { 130, 150, 175, 255 };
+
+    if (g_logo_large) {
+        int size = 200;
+        SDL_Rect dst = { (SCREEN_W - size) / 2, 160, size, size };
+        SDL_RenderCopy(g_renderer, g_logo_large, NULL, &dst);
+    }
+
+    draw_text(SCREEN_W / 2 - 135, 410, "A-Theme Installer", white);
+    draw_text_small(SCREEN_W / 2 - 110, 452, message, dim);
+
+    // Indeterminate progress bar -- a gradient block sliding back and
+    // forth, since the manifest's size isn't known ahead of time.
+    int barW = 420, barH = 6;
+    int barX = (SCREEN_W - barW) / 2, barY = 505;
+    fill_rect(barX, barY, barW, barH, (RGBA){ 34, 52, 74, 255 });
+
+    int chunk = 130;
+    int span = barW - chunk;
+    if (span < 1) span = 1;
+    int pos = frame % (span * 2);
+    if (pos > span) pos = span * 2 - pos; // bounce back at the ends
+    draw_brand_gradient(barX + pos, barY, chunk, barH);
+
+    SDL_RenderPresent(g_renderer);
+}
+
 static void draw_menu(Theme *themes, int count, int cursor, int scroll, const char *status) {
-    SDL_SetRenderDrawColor(g_renderer, 11, 20, 32, 255);
-    SDL_RenderClear(g_renderer);
+    // Subtle vertical fade rather than a flat fill -- gives the screen
+    // some depth on a large TV without being distracting.
+    draw_vgradient(0, 0, SCREEN_W, SCREEN_H, (RGBA){ 14, 25, 39, 255 }, BG_DEEP);
 
     SDL_Color white  = { 234, 241, 250, 255 };
     SDL_Color dim    = { 120, 138, 158, 255 };
     SDL_Color accent = { 60, 200, 255, 255 };
+    SDL_Color tagcol = { 150, 120, 210, 255 };
 
-    draw_text(40, 26, "A-Theme Installer", white);
-    draw_text_small(40, 62, "Tinfoil theme downloader", dim);
-    fill_rect(40, 92, SCREEN_W - 80, 2, (RGBA){ 40, 60, 85, 255 });
+    // --- header band, with the brand gradient as a top edge ---
+    draw_vgradient(0, 0, SCREEN_W, 104, (RGBA){ 20, 34, 52, 255 }, (RGBA){ 13, 23, 36, 255 });
+    draw_brand_gradient(0, 0, SCREEN_W, 4);
+
+    // Logo, if it loaded. Text shifts right to make room; if the logo is
+    // missing the layout falls back to the original left margin.
+    int textX = 40;
+    if (g_logo && g_logo_h > 0) {
+        int lh = 64;
+        int lw = (int)((float)g_logo_w / g_logo_h * lh);
+        SDL_Rect dst = { 34, 18, lw, lh };
+        SDL_RenderCopy(g_renderer, g_logo, NULL, &dst);
+        textX = 34 + lw + 20;
+    }
+
+    draw_text(textX, 24, "A-Theme Installer", white);
+    draw_text_small(textX + 2, 62, "Tinfoil theme downloader", dim);
+
+    // theme count, right-aligned in the header
+    if (count > 0) {
+        char cbuf[48];
+        snprintf(cbuf, sizeof(cbuf), "%d themes", count);
+        draw_text_small(SCREEN_W - 150, 62, cbuf, dim);
+    }
 
     if (count == 0) {
-        draw_text(40, 130, "No themes found in the manifest.", dim);
+        draw_text(40, 150, "No themes found in the manifest.", dim);
     } else {
-        int y = 116;
+        int listTop = 118;
         int rowH = 34;
         int end = scroll + PAGE_SIZE;
         if (end > count) end = count;
+
+        int y = listTop;
         for (int i = scroll; i < end; i++) {
-            if (i == cursor) {
-                fill_rect(30, y - 4, SCREEN_W - 60, rowH, (RGBA){ 60, 200, 255, 35 });
-                draw_text(50, y, themes[i].name, accent);
+            bool isSel = (i == cursor);
+            bool isCommunity = (strncmp(themes[i].name, "[Community]", 11) == 0);
+            const char *label = isCommunity ? themes[i].name + 12 : themes[i].name;
+
+            if (isSel) {
+                // Layered highlight: a wide soft glow, a brighter core,
+                // then a solid accent bar on the leading edge. Cheap to
+                // draw and reads much better on a TV than a flat tint.
+                fill_rect(26, y - 8, SCREEN_W - 52, rowH + 6, (RGBA){ 0, 194, 255, 14 });
+                fill_rect(30, y - 5, SCREEN_W - 60, rowH, (RGBA){ 0, 194, 255, 32 });
+                fill_rect(30, y - 5, 4, rowH, BRAND_BLUE);
+                draw_text(52, y, label, accent);
             } else {
-                draw_text(50, y, themes[i].name, white);
+                draw_text(52, y, label, white);
+            }
+
+            // community themes get a small tag on the right
+            if (isCommunity) {
+                draw_text_small(SCREEN_W - 190, y + 5, "community", tagcol);
             }
             y += rowH;
         }
+
+        // --- scrollbar, showing where you are in the full list ---
         if (count > PAGE_SIZE) {
+            int trackX = SCREEN_W - 46;
+            int trackY = listTop - 4;
+            int trackH = PAGE_SIZE * rowH;
+            fill_rect(trackX, trackY, 4, trackH, (RGBA){ 40, 60, 85, 255 });
+
+            int thumbH = (int)((float)PAGE_SIZE / count * trackH);
+            if (thumbH < 24) thumbH = 24;
+            int maxScroll = count - PAGE_SIZE;
+            float prog = maxScroll > 0 ? (float)scroll / maxScroll : 0.0f;
+            int thumbY = trackY + (int)((trackH - thumbH) * prog);
+            fill_rect(trackX, thumbY, 4, thumbH, BRAND_BLUE);
+
             char buf[32];
-            snprintf(buf, sizeof(buf), "(%d/%d)", cursor + 1, count);
-            draw_text_small(40, y + 6, buf, dim);
+            snprintf(buf, sizeof(buf), "%d / %d", cursor + 1, count);
+            draw_text_small(40, trackY + trackH + 10, buf, dim);
         }
     }
 
-    fill_rect(40, SCREEN_H - 70, SCREEN_W - 80, 2, (RGBA){ 40, 60, 85, 255 });
-    if (status && status[0]) draw_text_small(40, SCREEN_H - 56, status, accent);
-    draw_text_small(40, SCREEN_H - 30, "A = Install    Y = Preview then install    + = Exit", dim);
+    // --- footer ---
+    int footY = SCREEN_H - 78;
+    draw_vgradient(0, footY, SCREEN_W, SCREEN_H - footY, (RGBA){ 13, 23, 36, 255 }, (RGBA){ 18, 30, 46, 255 });
+    fill_rect(0, footY, SCREEN_W, 1, (RGBA){ 40, 60, 85, 255 });
+
+    if (status && status[0]) draw_text_small(40, footY + 12, status, accent);
+    draw_text_small(40, SCREEN_H - 32,
+        "A = Install     Y = Preview / edit     + = Exit", dim);
+
+    draw_brand_gradient(0, SCREEN_H - 3, SCREEN_W, 3);
 
     SDL_RenderPresent(g_renderer);
 }
@@ -1398,10 +1648,20 @@ static bool init_graphics(char *err, size_t errcap) {
         return false;
     }
 
+    // Logos come from romfs, so they're baked into the .nro itself.
+    // Deliberately non-fatal: if either fails to load the app still runs
+    // perfectly, it just draws a text-only header. A missing decoration
+    // should never stop someone installing themes.
+    g_logo = IMG_LoadTexture(g_renderer, "romfs:/logo.png");
+    if (g_logo) SDL_QueryTexture(g_logo, NULL, NULL, &g_logo_w, &g_logo_h);
+    g_logo_large = IMG_LoadTexture(g_renderer, "romfs:/logo_large.png");
+
     return true;
 }
 
 static void shutdown_graphics(void) {
+    if (g_logo) SDL_DestroyTexture(g_logo);
+    if (g_logo_large) SDL_DestroyTexture(g_logo_large);
     if (g_font) TTF_CloseFont(g_font);
     if (g_font_small) TTF_CloseFont(g_font_small);
     plExit();
@@ -1434,7 +1694,12 @@ int main(int argc, char **argv) {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
 
-    draw_menu(NULL, 0, 0, 0, "Fetching theme list...");
+    // Show the splash for a few frames so the logo actually registers
+    // before the (blocking) manifest download begins.
+    for (int f = 0; f < 30; f++) {
+        draw_splash("Fetching theme list...", f * 4);
+        svcSleepThread(16000000ULL); // ~16ms, roughly one frame
+    }
 
     Theme *themes = malloc(sizeof(Theme) * MAX_THEMES);
     int themeCount = 0;
@@ -1486,20 +1751,54 @@ int main(int argc, char **argv) {
                 bool wantsPreview = (kDown & HidNpadButton_Y) != 0;
                 Theme *t = &themes[cursor];
 
-                snprintf(statusMsg, sizeof(statusMsg), "Installing \"%s\"...", t->name);
-                draw_menu(themes, themeCount, cursor, scroll, statusMsg);
+                char dest_dir[300];
+                snprintf(dest_dir, sizeof(dest_dir), THEMES_ROOT "%s", t->folder);
 
-                char detail[128] = "";
-                bool ok = install_theme(t, detail, sizeof(detail));
+                // Is this theme already on the SD card? Re-extracting over
+                // an existing install silently destroys any palette edits
+                // made here previously -- the zip's original settings.json
+                // overwrites the edited one. That cost several rounds of
+                // debugging: the palette saves were working correctly every
+                // time, and the NEXT install was wiping them.
+                char existing_cfg[400];
+                snprintf(existing_cfg, sizeof(existing_cfg), "%s/settings.json", dest_dir);
+                char *existing = NULL;
+                size_t existing_len = 0;
+                bool already_installed = read_file(existing_cfg, &existing, &existing_len);
+                if (existing) free(existing);
 
-                if (!ok) {
-                    snprintf(statusMsg, sizeof(statusMsg), "Failed: %s -- \"%s\"", detail, t->name);
+                bool ok = true;
+                bool skipped_download = false;
+
+                if (already_installed) {
+                    bool redownload = confirm_prompt(
+                        "This theme is already installed.",
+                        "Download a fresh copy? That REPLACES it, discarding any palette",
+                        "changes you saved here. Choose No to keep what's on your SD card.");
+                    if (redownload) {
+                        snprintf(statusMsg, sizeof(statusMsg), "Reinstalling \"%s\"...", t->name);
+                        draw_menu(themes, themeCount, cursor, scroll, statusMsg);
+                        char detail[128] = "";
+                        ok = install_theme(t, detail, sizeof(detail));
+                        if (!ok) snprintf(statusMsg, sizeof(statusMsg), "Failed: %s -- \"%s\"", detail, t->name);
+                    } else {
+                        skipped_download = true;
+                    }
                 } else {
+                    snprintf(statusMsg, sizeof(statusMsg), "Installing \"%s\"...", t->name);
+                    draw_menu(themes, themeCount, cursor, scroll, statusMsg);
+                    char detail[128] = "";
+                    ok = install_theme(t, detail, sizeof(detail));
+                    if (!ok) snprintf(statusMsg, sizeof(statusMsg), "Failed: %s -- \"%s\"", detail, t->name);
+                }
+
+                if (ok) {
                     bool keep = true;
                     if (wantsPreview) {
-                        char dest_dir[300];
-                        snprintf(dest_dir, sizeof(dest_dir), THEMES_ROOT "%s", t->folder);
-                        keep = show_theme_preview_and_confirm(dest_dir, t->name);
+                        // Deleting is only offered as an undo for a
+                        // download that just happened. If we kept the
+                        // user's existing copy, B must not destroy it.
+                        keep = show_theme_preview_and_confirm(dest_dir, t->name, !skipped_download);
                         if (!keep) {
                             remove_dir_recursive(dest_dir);
                             snprintf(statusMsg, sizeof(statusMsg), "Removed \"%s\".", t->name);
@@ -1522,14 +1821,16 @@ int main(int argc, char **argv) {
                             char err[160] = "";
                             if (set_active_theme(t->folder, err, sizeof(err))) {
                                 snprintf(statusMsg, sizeof(statusMsg),
-                                    "Installed \"%s\" and set it active -- restart Tinfoil to see it.", t->name);
+                                    "%s \"%s\" and set it active -- restart Tinfoil to see it.",
+                                    skipped_download ? "Kept your existing" : "Installed", t->name);
                             } else {
                                 snprintf(statusMsg, sizeof(statusMsg),
-                                    "Installed \"%s\", but couldn't set it active: %s", t->name, err);
+                                    "\"%s\" ready, but couldn't set it active: %s", t->name, err);
                             }
                         } else {
                             snprintf(statusMsg, sizeof(statusMsg),
-                                "Installed \"%s\" -- pick it in Tinfoil's theme settings.", t->name);
+                                "%s \"%s\" -- pick it in Tinfoil's theme settings.",
+                                skipped_download ? "Kept your existing" : "Installed", t->name);
                         }
                     }
                 }
