@@ -19,7 +19,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := A-Theme Installer
 APP_AUTHOR  := A-Theme
-APP_VERSION := 1.0.0
+APP_VERSION := 2.0.2
 # Switch homebrew icons must be 256x256 JPEG -- icon.jpg in this folder
 # is exactly that (the A-Theme logo, flattened onto its own dark
 # background since JPEG has no alpha channel).

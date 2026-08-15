@@ -7,7 +7,7 @@ each one found something real to fix (see the README's "Status" section
 for the full history). What's true right now:
 
 - **Verified for real, compiled and run on a PC:** all manifest parsing,
-  all nested theme.json field lookups, hex color decoding, k-means color
+  all nested theme-config field lookups, hex color decoding, k-means color
   clustering (tested against a synthetic image with 4 known dominant
   colors in known proportions — recovered all 4 exactly), and in-place
   JSON color editing (tested against real settings.json content — edited
@@ -38,12 +38,15 @@ sudo dkp-pacman -S switch-dev switch-curl switch-mbedtls switch-zlib switch-zzip
 pacman -S switch-dev switch-curl switch-mbedtls switch-zlib switch-zziplib switch-sdl2 switch-sdl2_image switch-sdl2_ttf
 ```
 
-## 3. Add the CA certificate bundle
+## 3. Check the romfs assets
 
-The `romfs/` folder already contains `logo.png` and `logo_large.png`
-(shipped with this repo — they get baked into the `.nro`, so there's
-nothing to place on the SD card). You just need to add the certificate
-bundle, which isn't redistributed here:
+The `romfs/` folder already contains everything the build needs —
+`logo.png`, `logo_large.png`, and `cacert.pem` — all shipped with this
+repo and baked into the `.nro`. Nothing goes on the SD card manually.
+
+The bundled `cacert.pem` is a snapshot of Mozilla's CA list. If HTTPS
+starts failing with certificate errors long after this release, refresh
+it:
 
 ```bash
 curl -o romfs/cacert.pem https://curl.se/ca/cacert.pem
@@ -75,7 +78,7 @@ On the preview screen, pressing **X**:
    selection/accent (color + its own background + border), frame border,
    progress bar — using the same role-based logic the browser editor
    suggests by default
-4. Edits `theme.json` **in place**: each color's hex text is overwritten
+4. Edits `settings.json` **in place**: each color's hex text is overwritten
    with the new value at the exact same byte length (padding/alpha
    preserved), so the file's total size never changes and no JSON
    serializer is needed — just precise, verified string surgery
@@ -128,4 +131,4 @@ Roughly in likelihood order:
 ## Updating later
 
 Nothing needs rebuilding when themes are added/removed/changed — the
-manifest and each theme's `theme.json` are fetched fresh every launch.
+manifest and each theme's `settings.json` are fetched fresh every launch.

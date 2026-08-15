@@ -8,6 +8,8 @@
   <img src="https://img.shields.io/badge/platform-Nintendo%20Switch-e60012?style=for-the-badge&logo=nintendoswitch&logoColor=white" alt="platform"/>
   <img src="https://img.shields.io/badge/toolchain-devkitA64%20%2F%20libnx-00c2ff?style=for-the-badge" alt="toolchain"/>
   <img src="https://img.shields.io/badge/license-MIT-9d4edd?style=for-the-badge" alt="license"/>
+  <img src="https://img.shields.io/github/v/release/A-Theme/Switch-Theme-Installer?style=for-the-badge&color=ff3c50" alt="release"/>
+  <img src="https://img.shields.io/badge/dynamic/json?label=themes&query=%24.themes.length&url=https%3A%2F%2Fraw.githubusercontent.com%2FA-Theme%2FTinfoil-Themes%2Fmain%2Fthemes.json&style=for-the-badge&color=00c2ff" alt="theme count"/>
 </p>
 
 </div>
@@ -79,7 +81,7 @@ each round fixed something real:
    re-extracted afterwards. The installer now detects an existing install
    and asks before replacing it.
 
-All the JSON/color-parsing logic (manifest parsing, nested theme.json
+All the JSON/color-parsing logic (manifest parsing, nested theme-config
 field lookups, hex color decoding) and the palette-generation logic
 (k-means color clustering, in-place JSON color editing, dynamic color
 counting) have been compiled and run for real on a PC against actual
@@ -98,7 +100,7 @@ confirmed on real hardware.
 <tr><td><b>—</b></td><td>Shows every theme as a scrollable menu, tagging community submissions</td></tr>
 <tr><td><b>A</b></td><td>Installs the highlighted theme immediately</td></tr>
 <tr><td><b>Y</b></td><td>Installs it, then shows a preview built from its real colors and assets — background, logo, an icon grid with a "selected" tile in the theme's actual selection colors, a border frame, a progress bar</td></tr>
-<tr><td><b>X</b><br><i>(on preview)</i></td><td>Regenerates the theme's palette straight from its own background image — real k-means color clustering finds the dominant colors and writes them directly into <code>theme.json</code> on the SD card, sized to match the theme's own color count. Press again for a different result.</td></tr>
+<tr><td><b>X</b><br><i>(on preview)</i></td><td>Regenerates the theme's palette straight from its own background image — real k-means color clustering finds the dominant colors and writes them directly into <code>settings.json</code> on the SD card, sized to match the theme's own color count. Press again for a different result.</td></tr>
 <tr><td><b>A</b> / <b>B</b><br><i>(on preview)</i></td><td>Keep whatever's currently applied, or discard the whole install</td></tr>
 </table>
 
@@ -141,6 +143,19 @@ on top of code that's still mid-way through its own hardware testing.
 
 ---
 
+## 📥 Installing it
+
+Grab `a-theme-installer.nro` from the
+[latest release](../../releases/latest), copy it to
+`sdmc:/switch/a-theme-installer/` on your SD card, and launch it from the
+Homebrew Menu.
+
+Needs a Switch running Atmosphère with Tinfoil already installed — the app
+writes into Tinfoil's own `sdmc:/switch/tinfoil/themes/` folder, and reads
+its `options.json` when setting an active theme.
+
+---
+
 ## 🛠️ Building it yourself
 
 See [`BUILD.md`](BUILD.md) — devkitPro/devkitA64, the `switch-curl` /
@@ -151,10 +166,15 @@ bundle for HTTPS.
 ## 📁 Files in this folder
 
 ```
-source/main.c     — the whole app
-include/jsmn.h    — bundled JSON parser (MIT, github.com/zserge/jsmn)
-Makefile          — devkitA64/libnx build config
-BUILD.md          — full setup + build + troubleshooting instructions
+source/main.c          — the whole app
+include/jsmn.h         — bundled JSON parser (MIT, github.com/zserge/jsmn)
+romfs/logo.png         — header logo, baked into the .nro
+romfs/logo_large.png   — splash logo
+romfs/cacert.pem       — CA bundle, required for HTTPS
+icon.jpg               — 256x256 hbmenu icon
+Makefile               — devkitA64/libnx build config
+BUILD.md               — full setup + build + troubleshooting instructions
+manifest-example/      — sample manifest layout for reference
 ```
 
 No manifest file needs to be created or maintained — it reads your repo's
