@@ -174,7 +174,6 @@ romfs/cacert.pem       — CA bundle, required for HTTPS
 icon.jpg               — 256x256 hbmenu icon
 Makefile               — devkitA64/libnx build config
 BUILD.md               — full setup + build + troubleshooting instructions
-manifest-example/      — sample manifest layout for reference
 ```
 
 No manifest file needs to be created or maintained — it reads your repo's
