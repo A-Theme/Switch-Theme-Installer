@@ -1,0 +1,18 @@
+# devkitPro build output
+build/
+*.nro
+*.nacp
+*.elf
+*.map
+*.lst
+*.o
+*.d
+
+# NOTE: romfs/cacert.pem IS tracked on purpose - it's baked into the .nro
+# and the app needs it for HTTPS. Do not ignore it.
+
+# Anything pulled off a console for testing.
+# Tinfoil's options.json holds live shop credentials - never commit one.
+options.json
+options.json.bak
+_download.zip
