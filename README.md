@@ -187,9 +187,19 @@ existing `themes.json` directly.
 
 [![Theme-App](https://img.shields.io/badge/Theme--App-visual%20editor-00c2ff?style=for-the-badge)](https://github.com/A-Theme/Theme-App)
 [![Tinfoil-Themes](https://img.shields.io/badge/Tinfoil--Themes-theme%20database-ff3c50?style=for-the-badge)](https://github.com/A-Theme/Tinfoil-Themes)
+[![RomM-Themes](https://img.shields.io/badge/RomM--Themes-romm%20theme%20database-5be27a?style=for-the-badge)](https://github.com/A-Theme/RomM-Themes)
 [![A-Theme](https://img.shields.io/badge/A--Theme-org-9d4edd?style=for-the-badge)](https://github.com/A-Theme)
 
 </div>
+
+There is now a **second** theming target in the project: the **RomM Switch
+client**. Its themes live in
+[RomM-Themes](https://github.com/A-Theme/RomM-Themes) and are edited with the
+RomM editor in
+[Theme-App](https://github.com/A-Theme/Theme-App/blob/main/romm-theme-editor.html).
+Different app, different format, and nothing in this installer changes because
+of it — a RomM theme is a folder the client reads itself, not a Tinfoil
+`options.json` patch.
 
 ## 📄 License
 
