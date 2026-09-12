@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block commits that would leak a real Tinfoil shop's credentials.
+#
+# Install:
+#   ln -sf ../../scripts/pre-commit .git/hooks/pre-commit     # macOS/Linux/WSL
+#   copy scripts\pre-commit .git\hooks\pre-commit             # Windows
+#
+# Bypass (only if you are certain):  git commit --no-verify
+#
+# Why this exists: this app patches Tinfoil's own options.json in place, and a
+# copy pulled off a console for testing carries that shop's real credentials -
+# linkedUserSig, fingerprint, googleApiKey, saved username and password.
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT" || exit 1
+
+RED=$'\033[0;31m'; RST=$'\033[0m'
+FAIL=0
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[[ -z "$STAGED" ]] && exit 0
+
+# 1. Filenames that must never be committed.
+while IFS= read -r f; do
+    case "$(basename "$f")" in
+        options.json|options.json.bak)
+            echo "${RED}BLOCKED${RST}: $f is a captured Tinfoil options file - real shop credentials"; FAIL=1 ;;
+        *.pem|*.p12|*.pfx|*.jks)
+            echo "${RED}BLOCKED${RST}: $f looks like a private key"; FAIL=1 ;;
+    esac
+done <<< "$STAGED"
+
+# 2. Content patterns, in case credentials are pasted into an ordinary file.
+while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    case "$f" in scripts/scan-secrets.sh|scripts/pre-commit) continue ;; esac
+    if git show ":$f" 2>/dev/null | grep -qE '"(linkedUserSig|fingerprint|googleApiKey)"[[:space:]]*:[[:space:]]*"[^"]{8,}"'; then
+        echo "${RED}BLOCKED${RST}: $f contains a Tinfoil credential field with a real value"
+        FAIL=1
+    fi
+    if git show ":$f" 2>/dev/null | grep -qE '"(username|password)"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+        echo "${RED}BLOCKED${RST}: $f contains a saved username/password field"
+        FAIL=1
+    fi
+    if git show ":$f" 2>/dev/null | grep -qE '(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|AKIA[0-9A-Z]{16})'; then
+        echo "${RED}BLOCKED${RST}: $f contains what looks like a GitHub token or AWS key"
+        FAIL=1
+    fi
+    if git show ":$f" 2>/dev/null | grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+        echo "${RED}BLOCKED${RST}: $f contains a private key block"; FAIL=1
+    fi
+done <<< "$STAGED"
+
+if [[ $FAIL -ne 0 ]]; then
+    echo
+    echo "Commit aborted."
+    echo "If you are certain this is safe: git commit --no-verify"
+    exit 1
+fi
+exit 0
